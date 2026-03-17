@@ -102,20 +102,119 @@ chmod 755 "${PAYLOAD_DIR}/etc/init.d/hwmond"
 echo "    Payload contents:"
 find "${PAYLOAD_DIR}" -type f | sed "s|${PAYLOAD_DIR}/|      /|"
 
-# ---- Create payload tarball ----
+# ---- Create payload tarball in VMware "visor" format ----
+#
+# ESXi uses a modified tar format with "visor" magic at offset 257
+# instead of "ustar", plus specific field formatting (7-char null-terminated
+# octal, uid/gid=311, uname="root", gname="root").
+# We build the ENTIRE tar in Python for byte-exact control.
 
 PAYLOAD_FILE="${TMPDIR}/payload1"
-# Use POSIX format, strip macOS metadata, set uid/gid to 0
-# COPYFILE_DISABLE prevents macOS from adding ._ resource fork files
-COPYFILE_DISABLE=1 tar czf "${PAYLOAD_FILE}" -C "${PAYLOAD_DIR}" \
-    --format=ustar \
-    --uid=0 --gid=0 \
-    --no-mac-metadata \
-    opt etc 2>/dev/null \
-    || COPYFILE_DISABLE=1 tar czf "${PAYLOAD_FILE}" -C "${PAYLOAD_DIR}" \
-    --format=ustar \
-    --uid=0 --gid=0 \
-    opt etc
+
+python3 - "${PAYLOAD_DIR}" "${PAYLOAD_FILE}" << 'PYEOF'
+import os, sys, struct, gzip, time
+
+def tar_checksum(header):
+    chk = 0
+    for i in range(512):
+        if 148 <= i < 156:
+            chk += 0x20
+        else:
+            chk += header[i]
+    return chk
+
+def make_header(name, size, mode, is_dir, mtime):
+    """Create a 512-byte visor tar header."""
+    h = bytearray(512)
+
+    # Name (100 bytes)
+    name_bytes = name.encode('ascii')[:100]
+    h[0:len(name_bytes)] = name_bytes
+
+    # Mode (8 bytes, 7-char octal null-terminated)
+    h[100:108] = ('%07o\x00' % mode).encode('ascii')
+
+    # UID (8 bytes) — ESXi uses 0
+    h[108:116] = b'0000000\x00'
+
+    # GID (8 bytes) — ESXi uses 0
+    h[116:124] = b'0000000\x00'
+
+    # Size (12 bytes, 11-char octal null-terminated)
+    h[124:136] = ('%011o\x00' % size).encode('ascii')
+
+    # Mtime (12 bytes, 11-char octal null-terminated)
+    h[136:148] = ('%011o\x00' % mtime).encode('ascii')
+
+    # Checksum placeholder (filled below)
+    h[148:156] = b'        '
+
+    # Type flag
+    h[156] = ord('5') if is_dir else ord('0')
+
+    # Magic: "visor  \0" at offset 257
+    h[257:265] = b'visor  \x00'
+
+    # Uname (32 bytes)
+    h[265:269] = b'root'
+
+    # Gname (32 bytes)
+    h[297:301] = b'root'
+
+    # Compute and set checksum
+    chk = tar_checksum(h)
+    h[148:156] = ('%06o\x00 ' % chk).encode('ascii')
+
+    return bytes(h)
+
+def visor_tar_gz(payload_dir, output_path):
+    entries = []
+
+    # Collect all files and directories
+    for root, dirs, files in os.walk(payload_dir):
+        rel = os.path.relpath(root, payload_dir)
+        if rel == '.':
+            rel = ''
+
+        # Add directory entry
+        if rel:
+            dir_path = rel + '/'
+            st = os.stat(root)
+            entries.append((dir_path, None, 0o755, True, int(st.st_mtime)))
+
+        # Add file entries
+        for fname in sorted(files):
+            full = os.path.join(root, fname)
+            rel_path = os.path.join(rel, fname) if rel else fname
+            st = os.stat(full)
+            entries.append((rel_path, full, st.st_mode & 0o7777, False, int(st.st_mtime)))
+
+    # Sort entries for consistent ordering
+    entries.sort(key=lambda e: e[0])
+
+    # Build tar and gzip
+    with gzip.open(output_path, 'wb') as gz:
+        for name, filepath, mode, is_dir, mtime in entries:
+            if is_dir:
+                hdr = make_header(name, 0, mode, True, mtime)
+                gz.write(hdr)
+            else:
+                data = open(filepath, 'rb').read()
+                hdr = make_header(name, len(data), mode, False, mtime)
+                gz.write(hdr)
+                gz.write(data)
+                # Pad to 512-byte boundary
+                remainder = len(data) % 512
+                if remainder:
+                    gz.write(b'\x00' * (512 - remainder))
+
+        # End-of-archive: two 512-byte zero blocks
+        gz.write(b'\x00' * 1024)
+
+    print(f"    Created visor tar with {len(entries)} entries")
+
+visor_tar_gz(sys.argv[1], sys.argv[2])
+PYEOF
 
 # ---- Compute checksums ----
 
@@ -179,16 +278,38 @@ XMLEOF
 
 touch "${TMPDIR}/sig.pkcs7"
 
-# ---- Assemble VIB (ar archive, order matters!) ----
+# ---- Assemble VIB (ar archive) ----
+#
+# ESXi requires a specific ar archive format. Both macOS ar (BSD format)
+# and GNU ar (trailing / on names) have subtle incompatibilities.
+# Use a Python script to produce the exact byte-level format ESXi expects.
 
-# Ensure output directory exists
 mkdir -p "$(dirname "${VIB_OUTPUT}")"
 
-# ar requires files in current directory on some platforms
-(
-    cd "${TMPDIR}"
-    ar r vib.ar descriptor.xml sig.pkcs7 payload1
-)
+echo "    Assembling VIB ar archive..."
+python3 - "${TMPDIR}" << 'PYEOF'
+import os, sys
+
+def ar_create(outpath, members):
+    with open(outpath, 'wb') as f:
+        f.write(b'!<arch>\n')
+        for name, filepath in members:
+            data = open(filepath, 'rb').read()
+            sz = len(data)
+            hdr = '%-16s%-12d%-6d%-6d%-8s%-10d\x60\n' % (
+                name, 0, 0, 0, '100644', sz)
+            f.write(hdr.encode('ascii'))
+            f.write(data)
+            if sz % 2 == 1:
+                f.write(b'\n')
+
+tmpdir = sys.argv[1]
+ar_create(os.path.join(tmpdir, 'vib.ar'), [
+    ('descriptor.xml', os.path.join(tmpdir, 'descriptor.xml')),
+    ('sig.pkcs7',      os.path.join(tmpdir, 'sig.pkcs7')),
+    ('payload1',       os.path.join(tmpdir, 'payload1')),
+])
+PYEOF
 
 cp "${TMPDIR}/vib.ar" "${VIB_OUTPUT}"
 
