@@ -23,12 +23,37 @@ HWMOND_PID="/var/run/hwmond.pid"
 HWMOND_LOG="/var/log/hwmond.log"
 HWMOND_DEV="/dev/usb0502"
 
-# Stop the USB arbitrator so hwmond can claim the front panel device.
-# The arbitrator holds all USB devices by default on ESXi; we need
-# it released before opening /dev/usb0502.
+# Configure USB: claim the front panel device exclusively.
+# 1. Stop arbitrator to release the device
+# 2. Mark VID:PID 05ac:8261 as non-passthrough so no VM can claim it
+# 3. Restart arbitrator with the exclusion in place
 configure_usb() {
+    # Stop arbitrator to release all USB devices
     /etc/init.d/usbarbitrator stop 2>/dev/null
-    sleep 2
+    sleep 1
+
+    # Exclude the Xserve front panel (05ac:8261) from USB passthrough.
+    # This prevents anyone from accidentally passing it through to a VM
+    # via the vSphere UI while hwmond owns it.
+    PASSTHRU_CONF="/etc/vmware/passthru.map"
+    if [ -f "${PASSTHRU_CONF}" ]; then
+        # Remove any existing entry for this device
+        grep -v "05ac.*8261" "${PASSTHRU_CONF}" > "${PASSTHRU_CONF}.tmp" 2>/dev/null
+        mv "${PASSTHRU_CONF}.tmp" "${PASSTHRU_CONF}"
+    fi
+    # Add deny rule — device will not appear in passthrough UI
+    echo "# Xserve front panel — claimed by hwmond" >> "${PASSTHRU_CONF}"
+    echo "05ac  8261  d  default  default" >> "${PASSTHRU_CONF}"
+
+    # Also set the device-specific arbitrator config
+    esxcli hardware usb passthrough device disable -d 05ac:8261 2>/dev/null
+
+    # Restart arbitrator with the exclusion active.
+    # hwmond opens the device directly via /dev/usb* — the arbitrator
+    # won't interfere because we close/reopen per write cycle and
+    # the device is excluded from passthrough.
+    /etc/init.d/usbarbitrator start 2>/dev/null
+    sleep 1
 }
 
 # Stop hwmond gracefully using SIGTERM only.

@@ -12,8 +12,7 @@
  *
  * Smoothing: linear ramp at RAMP_STEP per frame with deceleration
  * near target (FINE_DIVISOR). At 10 Hz with RAMP_STEP=0.10, a full
- * 0->1 transition takes 0.5 seconds (5 frames), matching Apple's
- * original visual behavior (100 Hz, RAMP_STEP=0.02, 50 frames).
+ * 0->1 transition takes ~0.5 seconds, matching Apple's original.
  *
  * USB writes occur only when LED byte values actually change.
  * Typical traffic: 5-10 writes/sec during transitions, 0 when stable.

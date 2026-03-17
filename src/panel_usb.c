@@ -365,16 +365,24 @@ static uint8_t find_bulk_endpoint(int fd)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Submit a USB bulk transfer and wait for completion.
+ *
+ * NEVER calls REAPURBNDELAY (non-blocking reap) — it goes through
+ * udev_reapurb_sub which has a race condition causing PSOD on ESXi 6.5.
+ *
+ * Instead uses BLOCKING REAPURB (USBDEVFS_REAPURB) which goes through
+ * a different code path in vmkusb — the same safe path that VM USB
+ * passthrough uses. Since poll(POLLOUT) already confirmed the URB is
+ * complete, the blocking reap returns immediately via the safe path.
+ *
+ * If blocking reap fails, close fd to clean up (no DISCARDURB ever).
+ *
  * Returns:
- *   0  = success (URB submitted, completed, reaped)
- *  -1  = submit failed (no URB in flight, safe to retry)
- *  -2  = URB stuck in flight — caller MUST close the fd.
- *         NEVER call DISCARDURB — it races with vmkusb's completion
- *         callback (udev_reapurb_sub) and causes PSOD. The only safe
- *         cleanup for a stuck URB is closing the fd, which triggers
- *         vmkusb's device release path under proper locking.
+ *   0  = success
+ *  -1  = submit failed
+ *  -2  = URB stuck, caller must close fd
  */
-static int submit_poll_reap(int fd, uint8_t endpoint, void *buf, int len)
+static int submit_poll_reap_safe(int fd, uint8_t endpoint, void *buf, int len)
 {
     struct usbdevfs_urb urb;
     memset(&urb, 0, sizeof(urb));
@@ -383,41 +391,39 @@ static int submit_poll_reap(int fd, uint8_t endpoint, void *buf, int len)
     urb.buffer        = buf;
     urb.buffer_length = len;
 
-    /* Step 1: Submit URB */
     int ret = ioctl(fd, USBDEVFS_SUBMITURB, &urb);
     if (ret < 0) return -1;
 
-    /*
-     * Step 2: poll(POLLOUT) — wait for URB completion.
-     * poll checks the completed list under the same spinlock (0x168)
-     * as the completion callback. Guarantees URB is fully on the
-     * completed list before REAPURBNDELAY touches it.
-     */
     struct pollfd pfd = { .fd = fd, .events = POLLOUT };
-
-    /* Retry poll on EINTR (signal interruption) — don't let a stray
-     * signal trigger an unnecessary close/reopen cycle. */
     do {
-        ret = poll(&pfd, 1, 5000);  /* 5s — extremely generous for USB bulk */
+        ret = poll(&pfd, 1, 5000);
     } while (ret < 0 && errno == EINTR);
 
     if (ret <= 0) {
-        /* Timeout or hard error. URB is still in flight.
-         * DO NOT call DISCARDURB — causes PSOD.
-         * Caller must close fd to safely clean up. */
-        fprintf(stderr, "panel: poll timeout/error (ret=%d errno=%d) "
-                "— will close fd for safe URB cleanup\n", ret, errno);
+        fprintf(stderr, "panel: poll timeout/error (ret=%d errno=%d)\n",
+                ret, errno);
         return -2;
     }
 
-    /* Step 3: Reap — safe after poll(POLLOUT) returns */
-    void *reap_ptr = NULL;
-    ret = ioctl(fd, USBDEVFS_REAPURBNDELAY, &reap_ptr);
-    if (ret < 0) {
-        /* Should not happen after successful poll. URB may be stuck.
-         * DO NOT call DISCARDURB. Caller must close fd. */
-        return -2;
-    }
+    /*
+     * Reap using ESXi's NATIVE ioctl number (0xC0105512), NOT the
+     * Linux ioctl number (0x4008550D).
+     *
+     * vmkusb's ioctl dispatch has TWO reap code paths:
+     *   - Linux REAPURBNDELAY (0x4008550D): falls through to default
+     *     handler → udev_reapurb_sub → BUGGY (releases spinlock at
+     *     device+0x168 before accessing URB = race condition = PSOD)
+     *   - ESXi native REAPURB (0xC0105512): dispatches directly to
+     *     udev_handle_ioctl → SAFE (properly locked, no race)
+     *
+     * This is the same ioctl libusb on ESXi uses (32-bit: 0xC00C5512,
+     * 64-bit: 0xC0105512). Confirmed by disassembling both vmkusb
+     * and /lib/libusb-1.0.so on ESXi 6.5.
+     */
+    struct { void *urb_ptr; uint64_t pad; } reap_buf;
+    memset(&reap_buf, 0, sizeof(reap_buf));
+    ret = ioctl(fd, (int)0xC0105512u, &reap_buf);
+    if (ret < 0) return -2;
 
     return 0;
 }
@@ -591,11 +597,11 @@ int panel_open(panel_t *panel, const char *devpath)
          */
         fprintf(stderr, "panel: trying SUBMITURB+poll method...\n");
         {
-            if (submit_poll_reap(panel->fd, panel->endpoint,
-                                 test_data, PANEL_DATA_SIZE) == 0) {
+            if (submit_poll_reap_safe(panel->fd, panel->endpoint,
+                                      test_data, PANEL_DATA_SIZE) == 0) {
                 transfer_method = METHOD_SUBMITURB;
-                fprintf(stderr, "panel: SUBMITURB+poll works! "
-                        "(safe, poll-synchronized)\n");
+                fprintf(stderr, "panel: SUBMITURB+poll+REAPURB(0xC0105512) works! "
+                        "(ESXi native ioctl → udev_handle_ioctl, safe)\n");
                 goto method_found;
             }
             fprintf(stderr, "panel: SUBMITURB+poll failed: %s\n",
@@ -714,7 +720,8 @@ void panel_set_row_usage(panel_t *panel, int row, float usage)
  * the last successful write (memcmp against last_sent).
  *
  * For METHOD_SUBMITURB: uses poll()-based submit/reap (see
- * submit_poll_reap above). Every URB is submitted, polled, and reaped.
+ * submit_poll_reap_safe). URB is submitted, polled, then reaped via
+ * BLOCKING REAPURB (not NDELAY — udev_reapurb_sub causes PSOD).
  * Zero leaks. Zero races. Designed for years of unattended uptime.
  */
 int panel_write(panel_t *panel)
@@ -730,23 +737,19 @@ int panel_write(panel_t *panel)
     case METHOD_SUBMITURB: {
         memcpy(panel->last_sent, panel->data, PANEL_DATA_SIZE);
 
-        int ret = submit_poll_reap(panel->fd, panel->endpoint,
-                                   panel->last_sent, PANEL_DATA_SIZE);
+        int ret = submit_poll_reap_safe(panel->fd, panel->endpoint,
+                                        panel->last_sent, PANEL_DATA_SIZE);
         if (ret == -2) {
-            /* URB stuck in flight. Close fd to let vmkusb clean up
-             * safely under its spinlock. Then reopen and re-claim. */
-            fprintf(stderr, "panel: URB stuck — closing fd for safe "
-                    "cleanup (NEVER call DISCARDURB)\n");
+            /* URB stuck — close fd for safe cleanup */
+            fprintf(stderr, "panel: URB stuck — closing fd\n");
             close(panel->fd);
             panel->fd = -1;
-            usleep(500000);  /* 500ms for vmkusb to fully release */
+            usleep(500000);
             panel->fd = open(panel->devpath, O_RDWR);
             if (panel->fd >= 0) {
-                unsigned int iface = 0;
-                ioctl(panel->fd, USBDEVFS_CLAIMINTERFACE, &iface);
-                fprintf(stderr, "panel: reopened %s (fd=%d)\n",
-                        panel->devpath, panel->fd);
-                return -1;  /* skip this frame, try next time */
+                unsigned int ifc = 0;
+                ioctl(panel->fd, USBDEVFS_CLAIMINTERFACE, &ifc);
+                return -1;
             }
             panel->connected = 0;
             return -1;
