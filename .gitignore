@@ -1,0 +1,6 @@
+build/
+*.o
+*.vib
+.DS_Store
+.claude/
+reference/
