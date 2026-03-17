@@ -43,12 +43,12 @@ make vib        # Build + package as VIB
 # Copy VIB to ESXi host
 scp build/hwmond-xserve.vib root@<host>:/tmp/
 
-# Install
+# Install (requires reboot — ESXi 6.5 cannot live-install bootbank VIBs)
 esxcli software acceptance set --level CommunitySupported
-esxcli software vib install -v /tmp/hwmond-xserve.vib --force --no-sig-check
+esxcli software vib install -v /tmp/hwmond-xserve.vib --force --no-sig-check --no-live-install
 
-# Start (or reboot)
-/etc/rc.local.d/hwmond-startup.sh
+# Reboot to activate
+reboot
 ```
 
 The VIB installs:

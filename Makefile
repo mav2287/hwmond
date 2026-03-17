@@ -46,7 +46,7 @@ ifndef ESXI_HOST
 endif
 	@echo "==> Deploying VIB to $(ESXI_HOST)..."
 	scp $(VIB_FILE) root@$(ESXI_HOST):/tmp/hwmond-xserve.vib
-	ssh root@$(ESXI_HOST) 'esxcli software acceptance set --level CommunitySupported && esxcli software vib install -v /tmp/hwmond-xserve.vib --force --no-sig-check && echo "VIB installed. Reboot or run: /etc/rc.local.d/hwmond-startup.sh"'
+	ssh root@$(ESXI_HOST) 'esxcli software acceptance set --level CommunitySupported && esxcli software vib install -v /tmp/hwmond-xserve.vib --force --no-sig-check --no-live-install && echo "VIB installed. Reboot required."'
 
 # ---- Test mode (native build, for dev machines with libusb) ----
 
