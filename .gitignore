@@ -1,6 +1,7 @@
 build/
 *.o
 *.vib
+!releases/*.vib
 .DS_Store
 .claude/
 reference/
