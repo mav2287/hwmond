@@ -27,6 +27,7 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <poll.h>
 #include "bmc.h"
 
@@ -746,19 +747,17 @@ static void send_all_cached(uint32_t uptime_secs)
         apple_set_packed(0xCB, 0x00, NULL, 0, s, 1);
     }
 
-    /* 0xC2 MemoryInfo: per-DIMM binary (6 bytes) + 3 packed strings
-     * Wire format from IPMISetAppleSystemMemoryInfo:
-     *   binary: [config_type(1), ecc_type(1), size_mb(4 LE)]
-     *   then:   [0x01 encoding=UTF-8]
-     *   then:   [str1_len, str1...] [str2_len, str2...] [str3_len, str3...]
-     * Strings: Slot name, Speed, Type
-     *
-     * First clear ALL old set_selectors to remove corrupt data from
-     * previous attempts, then write fresh entries. */
-    for (int i = 0; i < MAX_DIMMS; i++)
-        apple_clear(0xC2, (uint8_t)i);
-    for (int i = 0; i < MAX_DIMMS; i++)
-        apple_clear(0xC9, (uint8_t)i);
+    /* Clear per-device parameters before writing fresh data.
+     * Matches original Apple hwmond behavior — prevents ghost devices
+     * from showing in Server Monitor when drives/NICs are removed.
+     * Original cleared: 0xC3, 0xC4, 0xC5, 0xC6, 0xCA
+     * We also clear: 0xC2, 0xC9 (memory) */
+    {
+        uint8_t clear_params[] = { 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC9 };
+        for (int p = 0; p < (int)(sizeof(clear_params)/sizeof(clear_params[0])); p++)
+            for (int i = 0; i < MAX_DIMMS; i++)
+                apple_clear(clear_params[p], (uint8_t)i);
+    }
 
     for (int i = 0; i < cache_dimm_count; i++) {
         uint8_t bin[6];
@@ -857,13 +856,6 @@ static void send_all_cached(uint32_t uptime_secs)
         int ret = apple_set_packed(0xC6, (uint8_t)i, bin, 20, strs, 5);
         if (ret < 0)
             fprintf(stderr, "bmc: 0xC6 NIC %d write FAILED\n", i);
-        else
-            fprintf(stderr, "bmc: 0xC6 NIC %d: link=%s speed=%s duplex=%s"
-                    " ip=%s\n", i,
-                    cache_net_dynamic[i].link,
-                    cache_net_dynamic[i].mbps,
-                    cache_net_dynamic[i].duplex,
-                    cache_net_dynamic[i].ipv4);
     }
 
     set_binary(0xC7, (uint8_t *)&uptime_secs, 4);
@@ -1230,6 +1222,19 @@ int bmc_init(void)
         }
         if (init_uptime > 0)
             fprintf(stderr, "bmc: initial uptime: %u sec\n", init_uptime);
+    }
+
+    /* Sync BMC clock — same as original Apple hwmond (once at startup).
+     * Standard IPMI: NetFn=0x0A (Storage), Cmd=0x49 (Set SEL Time).
+     * Sends 4-byte Unix timestamp so BMC event log has correct times. */
+    {
+        time_t now = time(NULL);
+        uint32_t ts = (uint32_t)now;
+        int ret = ipmi_cmd(0x0A, 0x49, (uint8_t *)&ts, 4);
+        if (ret == 0)
+            fprintf(stderr, "bmc: SEL time synced to %u\n", ts);
+        else
+            fprintf(stderr, "bmc: SEL time sync failed\n");
     }
 
     /* Send everything to BMC */
