@@ -253,7 +253,7 @@ static void *cpu_thread_func(void *arg)
 /* ------------------------------------------------------------------ */
 
 /*
- * LED update thread: runs at 10 Hz (LED_UPDATE_INTERVAL_US per frame).
+ * LED update thread: runs at 100 Hz (LED_UPDATE_INTERVAL_US per frame).
  *
  * Each frame:
  *   1. Read target usage values from shared state (under mutex)
@@ -368,7 +368,7 @@ static void *led_thread_func(void *arg)
             write_failures = 0;
         }
 
-        /* Sleep for one frame (100ms = 10 Hz) */
+        /* Sleep for one frame (10ms = 100 Hz) */
         usleep(LED_UPDATE_INTERVAL_US);
     }
 
@@ -654,7 +654,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "hwmond: running (%d packages, 10 Hz LED, "
+    fprintf(stderr, "hwmond: running (%d packages, 100 Hz LED, "
             "poll-based USB)\n", g_cpu.num_packages);
 
     /*
@@ -663,7 +663,7 @@ int main(int argc, char *argv[])
      * CPU thread: calls cpu_sample() every 1 second, publishes
      * package_usage under g_cpu_mutex.
      *
-     * LED thread: runs at 10 Hz, reads target from g_cpu_mutex,
+     * LED thread: runs at 100 Hz, reads target from g_cpu_mutex,
      * applies smoothing, writes to USB when values change.
      *
      * Main thread: waits for g_running=0 (from signal handler),
