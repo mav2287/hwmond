@@ -1,18 +1,19 @@
 /*
- * hwmond - Hardware Monitor Daemon for Apple Xserve on ESXi
+ * hwmond - Hardware Monitor Daemon for Apple Xserve
  *
  * Drives the front panel CPU activity LED bar graph on Intel Xserve
- * servers running VMware ESXi. Replaces Apple's hwmond which only
- * ran on macOS.
+ * servers running VMware ESXi or Linux. Replaces Apple's hwmond
+ * which only ran on macOS, and additionally populates the BMC with
+ * system information for Apple Server Monitor.
  *
  * Architecture (matches original Apple hwmond):
- *   - CPU thread: polls ESXi for per-package CPU utilization (1 Hz)
- *   - LED thread: smooths and writes LED data to USB panel (10 Hz)
+ *   - CPU thread: polls per-package CPU utilization (1 Hz)
+ *   - LED thread: smooths and writes LED data to USB panel (100 Hz)
  *   - Main thread: signal handling and coordination
  *
- * Smoothing: linear ramp at RAMP_STEP per frame with deceleration
- * near target (FINE_DIVISOR). At 10 Hz with RAMP_STEP=0.10, a full
- * 0->1 transition takes ~0.5 seconds, matching Apple's original.
+ * Smoothing parameters matched exactly to Apple's original hwmond
+ * (verified by disassembly): RAMP_STEP=0.02 at 100 Hz with
+ * FINE_DIVISOR=5.0 for deceleration near target.
  *
  * USB writes occur only when LED byte values actually change.
  * Typical traffic: 5-10 writes/sec during transitions, 0 when stable.
@@ -42,30 +43,19 @@
 /*  Tuning constants                                                   */
 /* ------------------------------------------------------------------ */
 
-/* LED thread frame interval: 100ms = 10 Hz */
-#define LED_UPDATE_INTERVAL_US  100000
+/* LED thread frame interval: 10ms = 100 Hz (matches Apple hwmond) */
+#define LED_UPDATE_INTERVAL_US  10000
 
 /*
- * Smoothing parameters (matched to original Apple hwmond behavior):
+ * Smoothing parameters — matched exactly to original Apple hwmond.
+ * Verified by disassembly of /usr/sbin/hwmond from Mac OS X Server.
  *
- * Apple original: 100 Hz, RAMP_STEP=0.02 => 0->1 in 50 frames (0.5s)
- * Our rate:        10 Hz, RAMP_STEP=0.10 => 0->1 in 10 frames (1.0s)
- *   ... but FINE_DIVISOR=5.0 decelerates near target, so effective
- *   ramp time is approximately 5 frames (0.5s) for the bulk of
- *   the transition, matching the Apple visual feel.
- *
- * RAMP_STEP: maximum change per frame when far from target.
+ * RAMP_STEP: 0.02 per frame at 100 Hz = 2.0/sec full-scale ramp rate.
  * FINE_DIVISOR: when |delta| < RAMP_STEP, step = delta/FINE_DIVISOR
  *   for smooth deceleration into the final value.
  */
-#define RAMP_STEP       0.10f
+#define RAMP_STEP       0.02f
 #define FINE_DIVISOR    5.0f
-
-/* Minimum LED usage floor — prevents the panel from going completely
- * dark when the system is idle. A fully dark panel looks like the
- * machine is off. This keeps the first LED very dimly lit to indicate
- * the system is alive. 0.01 = ~1% = barely visible glow. */
-#define MIN_USAGE_FLOOR 0.01f
 
 /* Maximum consecutive USB write failures before LED thread exits */
 #define MAX_WRITE_FAILURES 10
@@ -292,13 +282,8 @@ static void *led_thread_func(void *arg)
 
         pthread_mutex_lock(&g_cpu_mutex);
         num_pkg = g_shared_num_packages;
-        for (int i = 0; i < MAX_PACKAGES; i++) {
+        for (int i = 0; i < MAX_PACKAGES; i++)
             target[i] = g_shared_usage[i];
-            /* Apply minimum floor — keeps first LED dimly lit when idle.
-             * A completely dark panel looks like the machine is off. */
-            if (target[i] < MIN_USAGE_FLOOR)
-                target[i] = MIN_USAGE_FLOOR;
-        }
         pthread_mutex_unlock(&g_cpu_mutex);
 
         /* Single-socket: mirror both rows */

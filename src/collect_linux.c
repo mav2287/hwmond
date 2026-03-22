@@ -26,10 +26,16 @@ static int read_file_trimmed(const char *path, char *buf, int bufsz)
     if (!fp) return -1;
     buf[0] = '\0';
     if (fgets(buf, bufsz, fp)) {
+        /* Trim trailing whitespace */
         int len = strlen(buf);
         while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'
                            || buf[len-1] == ' '))
             buf[--len] = '\0';
+        /* Trim leading whitespace */
+        char *p = buf;
+        while (*p == ' ' || *p == '\t') p++;
+        if (p != buf)
+            memmove(buf, p, strlen(p) + 1);
     }
     fclose(fp);
     return strlen(buf);
@@ -67,13 +73,28 @@ int collect_system_info(system_info_t *info)
     if (popen_line("hostname -f 2>/dev/null", info->fqdn, CACHE_SIZE) <= 0)
         strncpy(info->fqdn, info->hostname, CACHE_SIZE - 1);
 
-    /* OS info from /etc/os-release */
+    /* OS info — check for Proxmox first, then fall back to /etc/os-release */
     {
+        int is_proxmox = 0;
+        char pve_ver[64] = {0};
+
+        /* Proxmox stores its version in the pve-manager package */
+        if (popen_line("dpkg-query -W -f='${Version}' pve-manager 2>/dev/null",
+                       pve_ver, sizeof(pve_ver)) > 0) {
+            is_proxmox = 1;
+            strncpy(info->os_product, "Proxmox VE", CACHE_SIZE - 1);
+            /* pve_ver is like "8.1.4" — use major.minor as version */
+            char *dot2 = strchr(pve_ver, '.');
+            if (dot2) dot2 = strchr(dot2 + 1, '.');
+            if (dot2) *dot2 = '\0'; /* truncate to major.minor */
+            strncpy(info->os_version, pve_ver, CACHE_SIZE - 1);
+        }
+
         FILE *fp = fopen("/etc/os-release", "r");
         if (fp) {
             char line[256];
             while (fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "NAME=", 5) == 0) {
+                if (!is_proxmox && strncmp(line, "NAME=", 5) == 0) {
                     char *p = line + 5;
                     if (*p == '"') p++;
                     int l = strlen(p);
@@ -81,7 +102,7 @@ int collect_system_info(system_info_t *info)
                         p[--l] = '\0';
                     strncpy(info->os_product, p, CACHE_SIZE - 1);
                 }
-                else if (strncmp(line, "VERSION_ID=", 11) == 0) {
+                else if (!is_proxmox && strncmp(line, "VERSION_ID=", 11) == 0) {
                     char *p = line + 11;
                     if (*p == '"') p++;
                     int l = strlen(p);

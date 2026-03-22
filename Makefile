@@ -3,12 +3,13 @@
 # ESXi:  cross-compile via zig cc → VIB package
 # Linux: native compile via gcc → .deb / .rpm / install.sh
 
-.PHONY: all esxi linux clean vib deb deploy help
+.PHONY: all esxi linux clean vib deb rpm deploy help
 
 BUILD_DIR    = build
 BINARY       = $(BUILD_DIR)/hwmond
 VIB_FILE     = $(BUILD_DIR)/hwmond-xserve.vib
-DEB_FILE     = $(BUILD_DIR)/hwmond-xserve-3.0.0.deb
+VERSION      = 3.2.0
+DEB_FILE     = $(BUILD_DIR)/hwmond-xserve-$(VERSION)-linux-amd64.deb
 
 # ESXi source files
 ESXI_SRC = src/main.c src/panel_usb.c src/cpu_usage.c src/collect_esxi.c src/bmc.c
@@ -54,17 +55,20 @@ vib: esxi
 # ---- Linux .deb packaging ----
 
 deb: linux
-	@echo "==> Packaging .deb..."
+	@echo "==> Packaging .deb (v$(VERSION))..."
+	@rm -rf $(BUILD_DIR)/deb-root
 	@mkdir -p $(BUILD_DIR)/deb-root/usr/local/sbin
 	@mkdir -p $(BUILD_DIR)/deb-root/etc/systemd/system
 	@mkdir -p $(BUILD_DIR)/deb-root/etc/udev/rules.d
+	@mkdir -p $(BUILD_DIR)/deb-root/etc/modprobe.d
 	@mkdir -p $(BUILD_DIR)/deb-root/DEBIAN
 	cp $(BINARY) $(BUILD_DIR)/deb-root/usr/local/sbin/hwmond
 	chmod 755 $(BUILD_DIR)/deb-root/usr/local/sbin/hwmond
 	cp scripts/hwmond.service $(BUILD_DIR)/deb-root/etc/systemd/system/
 	cp scripts/99-xserve-panel.rules $(BUILD_DIR)/deb-root/etc/udev/rules.d/
+	cp scripts/hwmond-ipmi.conf $(BUILD_DIR)/deb-root/etc/modprobe.d/
 	@echo "Package: hwmond-xserve" > $(BUILD_DIR)/deb-root/DEBIAN/control
-	@echo "Version: 3.0.0" >> $(BUILD_DIR)/deb-root/DEBIAN/control
+	@echo "Version: $(VERSION)" >> $(BUILD_DIR)/deb-root/DEBIAN/control
 	@echo "Architecture: amd64" >> $(BUILD_DIR)/deb-root/DEBIAN/control
 	@echo "Maintainer: hwmond" >> $(BUILD_DIR)/deb-root/DEBIAN/control
 	@echo "Depends: dmidecode" >> $(BUILD_DIR)/deb-root/DEBIAN/control
@@ -81,6 +85,25 @@ deb: linux
 	dpkg-deb --build $(BUILD_DIR)/deb-root $(DEB_FILE)
 	@echo "==> .deb: $(DEB_FILE)"
 	@ls -lh $(DEB_FILE)
+
+# ---- Linux .rpm packaging ----
+
+RPM_FILE = $(BUILD_DIR)/hwmond-xserve-$(VERSION)-1.noarch.rpm
+
+rpm: linux
+	@echo "==> Packaging .rpm (v$(VERSION))..."
+	@rm -rf $(BUILD_DIR)/rpmbuild
+	@mkdir -p $(BUILD_DIR)/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+	rpmbuild -bb \
+	  --target noarch \
+	  --define "_topdir $(CURDIR)/$(BUILD_DIR)/rpmbuild" \
+	  --define "_hwmond_version $(VERSION)" \
+	  --define "_hwmond_binary $(CURDIR)/$(BINARY)" \
+	  --define "_hwmond_scripts $(CURDIR)/scripts" \
+	  scripts/hwmond.spec
+	cp $(BUILD_DIR)/rpmbuild/RPMS/noarch/$(notdir $(RPM_FILE)) $(RPM_FILE)
+	@echo "==> .rpm: $(RPM_FILE)"
+	@ls -lh $(RPM_FILE)
 
 # ---- Deploy to ESXi ----
 
@@ -110,6 +133,7 @@ help:
 	@echo "Linux targets:"
 	@echo "  make linux    Build native Linux binary"
 	@echo "  make deb      Build + package as Debian .deb"
+	@echo "  make rpm      Build + package as RPM"
 	@echo ""
 	@echo "Other:"
 	@echo "  make clean    Remove build artifacts"
