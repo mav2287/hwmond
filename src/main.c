@@ -61,6 +61,12 @@
 #define RAMP_STEP       0.10f
 #define FINE_DIVISOR    5.0f
 
+/* Minimum LED usage floor — prevents the panel from going completely
+ * dark when the system is idle. A fully dark panel looks like the
+ * machine is off. This keeps the first LED very dimly lit to indicate
+ * the system is alive. 0.01 = ~1% = barely visible glow. */
+#define MIN_USAGE_FLOOR 0.01f
+
 /* Maximum consecutive USB write failures before LED thread exits */
 #define MAX_WRITE_FAILURES 10
 
@@ -288,6 +294,10 @@ static void *led_thread_func(void *arg)
         num_pkg = g_shared_num_packages;
         for (int i = 0; i < MAX_PACKAGES; i++) {
             target[i] = g_shared_usage[i];
+            /* Apply minimum floor — keeps first LED dimly lit when idle.
+             * A completely dark panel looks like the machine is off. */
+            if (target[i] < MIN_USAGE_FLOOR)
+                target[i] = MIN_USAGE_FLOOR;
         }
         pthread_mutex_unlock(&g_cpu_mutex);
 

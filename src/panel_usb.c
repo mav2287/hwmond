@@ -557,22 +557,43 @@ int panel_open(panel_t *panel, const char *devpath)
 
     /*
      * Step 9: Auto-detect which transfer method works.
-     * Try each in order of preference:
-     *   1. BULK (old sync ioctl -- safe, no race, but deprecated)
-     *   2. SUBMITURB with poll()-based reap (async, provably safe)
-     *   3. CONTROL transfer (send data via endpoint 0)
-     *   4. Direct write() to the fd
+     * On Linux: prefer SUBMITURB+poll (smoother timing than sync BULK).
+     * On ESXi: BULK fails, SUBMITURB+poll with safe ioctl is used.
+     *
+     * Order: SUBMITURB first (smoother), BULK fallback, then others.
      */
     {
         uint8_t test_data[PANEL_DATA_SIZE];
         memset(test_data, 0, sizeof(test_data));
 
         /*
-         * Try BULK (synchronous) first -- atomically handled in the
-         * kernel with no race window. A good fallback for hardware
-         * where it works.
+         * Try SUBMITURB+poll first — smoother timing than sync BULK.
+         * poll(POLLOUT) returns as soon as the URB completes, giving
+         * precise control over the 10Hz update cadence.
          */
-        fprintf(stderr, "panel: trying BULK method (preferred)...\n");
+        fprintf(stderr, "panel: trying SUBMITURB+poll method...\n");
+        {
+            if (submit_poll_reap_safe(panel->fd, panel->endpoint,
+                                      test_data, PANEL_DATA_SIZE) == 0) {
+                transfer_method = METHOD_SUBMITURB;
+#ifdef __ESXI__
+                fprintf(stderr, "panel: SUBMITURB+poll+REAPURB(0xC0105512) works! "
+                        "(ESXi native ioctl)\n");
+#else
+                fprintf(stderr, "panel: SUBMITURB+poll+REAPURB works! "
+                        "(async, smooth timing)\n");
+#endif
+                goto method_found;
+            }
+            fprintf(stderr, "panel: SUBMITURB+poll failed: %s\n",
+                    strerror(errno));
+        }
+
+        /*
+         * BULK (synchronous) fallback — works but blocks the thread
+         * during transfer, causing less smooth LED timing.
+         */
+        fprintf(stderr, "panel: trying BULK method (fallback)...\n");
         {
             struct usbdevfs_bulktransfer bulk = {
                 .ep      = panel->endpoint,
@@ -583,29 +604,10 @@ int panel_open(panel_t *panel, const char *devpath)
 
             if (ioctl(panel->fd, USBDEVFS_BULK, &bulk) >= 0) {
                 transfer_method = METHOD_BULK;
-                fprintf(stderr, "panel: BULK works! (safe, no race)\n");
+                fprintf(stderr, "panel: BULK works! (sync fallback)\n");
                 goto method_found;
             }
             fprintf(stderr, "panel: BULK failed: %s\n",
-                    strerror(errno));
-        }
-
-        /*
-         * SUBMITURB with poll()-based completion wait.
-         * poll(POLLOUT) uses the same spinlock as the URB completion
-         * callback, guaranteeing the URB is on the completed list
-         * before we reap it. This is how VMware's own vmx does it.
-         */
-        fprintf(stderr, "panel: trying SUBMITURB+poll method...\n");
-        {
-            if (submit_poll_reap_safe(panel->fd, panel->endpoint,
-                                      test_data, PANEL_DATA_SIZE) == 0) {
-                transfer_method = METHOD_SUBMITURB;
-                fprintf(stderr, "panel: SUBMITURB+poll+REAPURB(0xC0105512) works! "
-                        "(ESXi native ioctl → udev_handle_ioctl, safe)\n");
-                goto method_found;
-            }
-            fprintf(stderr, "panel: SUBMITURB+poll failed: %s\n",
                     strerror(errno));
         }
 
