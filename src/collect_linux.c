@@ -423,15 +423,17 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
             }
         }
 
-        /* SSD/HDD from rotational flag */
-        int rota = 1;
-        snprintf(sysname, sizeof(sysname), "/sys/block/%s/queue/rotational", name);
-        {
+        /* SSD/HDD — NVMe is always SSD, others check rotational flag */
+        if (strncmp(name, "nvme", 4) == 0) {
+            strncpy(d->kind, "SSD", 7);
+        } else {
+            int rota = 1;
+            snprintf(sysname, sizeof(sysname), "/sys/block/%s/queue/rotational", name);
             char rbuf[8];
             if (read_file_trimmed(sysname, rbuf, sizeof(rbuf)) > 0)
                 rota = atoi(rbuf);
+            strncpy(d->kind, rota ? "HDD" : "SSD", 7);
         }
-        strncpy(d->kind, rota ? "HDD" : "SSD", 7);
 
         /* Transport */
         if (strncmp(name, "nvme", 4) == 0)
@@ -541,32 +543,73 @@ int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
         if (read_file_trimmed(path, buf, sizeof(buf)) > 0)
             strncpy(dynamic[i].duplex, buf, sizeof(dynamic[i].duplex) - 1);
 
-        /* IP address from 'ip addr show DEV' */
+        /* IP address — trace up through bond/bridge hierarchy.
+         * Physical NIC may not have an IP directly; the IP could be on:
+         *   NIC → bond → bridge → IP (Proxmox default)
+         *   NIC → bridge → IP
+         *   NIC → IP (simple setup) */
         {
-            char cmd[128];
-            snprintf(cmd, sizeof(cmd), "ip -4 addr show %s 2>/dev/null | grep inet", name);
-            FILE *fp = popen(cmd, "r");
-            if (fp) {
-                char ipline[256];
-                if (fgets(ipline, sizeof(ipline), fp)) {
-                    char *p = strstr(ipline, "inet ");
-                    if (p) {
-                        p += 5;
-                        char *slash = strchr(p, '/');
-                        if (slash) {
-                            int iplen = slash - p;
-                            if (iplen < (int)sizeof(dynamic[i].ipv4))
-                                strncpy(dynamic[i].ipv4, p, iplen);
-                            int prefix = atoi(slash + 1);
-                            uint32_t mask = prefix ? (~0U << (32 - prefix)) : 0;
-                            snprintf(dynamic[i].netmask, sizeof(dynamic[i].netmask),
-                                     "%d.%d.%d.%d",
-                                     (mask >> 24) & 0xFF, (mask >> 16) & 0xFF,
-                                     (mask >> 8) & 0xFF, mask & 0xFF);
-                        }
+            /* Try the NIC itself, then its master (bond), then bond's master (bridge) */
+            char try_ifaces[3][32];
+            int try_count = 0;
+            char master_path[128], master_link[256];
+
+            strncpy(try_ifaces[try_count++], name, 31);
+
+            /* Check for bond master: /sys/class/net/NIC/master → bond */
+            snprintf(master_path, sizeof(master_path),
+                     "/sys/class/net/%s/master", name);
+            int mlen = readlink(master_path, master_link, sizeof(master_link) - 1);
+            if (mlen > 0) {
+                master_link[mlen] = '\0';
+                char *bond = strrchr(master_link, '/');
+                if (bond) {
+                    strncpy(try_ifaces[try_count++], bond + 1, 31);
+
+                    /* Check for bridge master: /sys/class/net/BOND/master → bridge */
+                    snprintf(master_path, sizeof(master_path),
+                             "/sys/class/net/%s/master", bond + 1);
+                    mlen = readlink(master_path, master_link, sizeof(master_link) - 1);
+                    if (mlen > 0) {
+                        master_link[mlen] = '\0';
+                        char *br = strrchr(master_link, '/');
+                        if (br) strncpy(try_ifaces[try_count++], br + 1, 31);
                     }
                 }
-                pclose(fp);
+            }
+
+            /* Try each interface for an IP (most specific first, then up) */
+            for (int t = try_count - 1; t >= 0 && !dynamic[i].ipv4[0]; t--) {
+                char cmd[128];
+                snprintf(cmd, sizeof(cmd),
+                         "ip -4 addr show %s 2>/dev/null | grep inet",
+                         try_ifaces[t]);
+                FILE *fp = popen(cmd, "r");
+                if (fp) {
+                    char ipline[256];
+                    if (fgets(ipline, sizeof(ipline), fp)) {
+                        char *p = strstr(ipline, "inet ");
+                        if (p) {
+                            p += 5;
+                            char *slash = strchr(p, '/');
+                            if (slash) {
+                                int iplen = slash - p;
+                                if (iplen < (int)sizeof(dynamic[i].ipv4))
+                                    strncpy(dynamic[i].ipv4, p, iplen);
+                                int prefix = atoi(slash + 1);
+                                uint32_t mask = prefix ? (~0U << (32 - prefix)) : 0;
+                                snprintf(dynamic[i].netmask,
+                                         sizeof(dynamic[i].netmask),
+                                         "%d.%d.%d.%d",
+                                         (mask >> 24) & 0xFF,
+                                         (mask >> 16) & 0xFF,
+                                         (mask >> 8) & 0xFF,
+                                         mask & 0xFF);
+                            }
+                        }
+                    }
+                    pclose(fp);
+                }
             }
         }
     }
