@@ -1,9 +1,0 @@
-#!/usr/bin/env python
-
-########################################################################
-# Copyright (C) 2010 VMWare, Inc.
-# All Rights Reserved
-########################################################################
-
-import vibauthorImpl
-vibauthorImpl.main()
