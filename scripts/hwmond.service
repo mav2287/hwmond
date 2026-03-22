@@ -1,0 +1,21 @@
+[Unit]
+Description=Apple Xserve Hardware Monitor (LED + BMC)
+Documentation=https://github.com/mav2287/hwmond
+After=network.target ipmi.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/hwmond
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hwmond
+
+# Security hardening
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
