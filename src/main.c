@@ -241,6 +241,12 @@ static void *cpu_thread_func(void *arg)
             bmc_update(g_cpu.uptime_usec);
             bmc_sample_count = 0;
         }
+
+        /* Graceful shutdown/restart from Server Monitor is handled
+         * natively by ESXi's hostd via its own IPMI stack. Confirmed
+         * by testing: hostd receives the BMC message, runs Auto Start
+         * Power Off for all VMs, then shuts down the host. Our agent
+         * does not need to poll for or act on these requests. */
     }
 
     return NULL;

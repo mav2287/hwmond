@@ -1272,6 +1272,22 @@ int bmc_update(uint64_t uptime_usec)
     return 0;
 }
 
+/*
+ * Graceful shutdown/restart from Apple Server Monitor:
+ * NOT handled by hwmond. ESXi's own hostd/IPMI stack receives the
+ * BMC message (0x36 0x04 [0x01/0x02]) and handles it natively:
+ *   - Runs Auto Start Power Off for all VMs
+ *   - Gracefully shuts down/restarts the host
+ * Confirmed by live testing: hostd processes the request without
+ * any assistance from hwmond.
+ *
+ * Apple OEM graceful control commands (documented for reference):
+ *   0x36 0x04 [0x01] = graceful shutdown (remote app → BMC)
+ *   0x36 0x04 [0x02] = graceful restart  (remote app → BMC)
+ *   0x36 0x05 [0x01] = shutdown acknowledged (OS agent → BMC)
+ *   0x36 0x05 [0x02] = restart acknowledged (OS agent → BMC)
+ */
+
 void bmc_shutdown(void)
 {
     bmc_available = 0;
