@@ -534,7 +534,7 @@ int bmc_init(void)
 
     /* Collect NICs */
     cache_nic_count = collect_nic_static(cache_nic_static, MAX_NICS);
-    collect_nic_dynamic(cache_nic_dynamic, cache_nic_count);
+    collect_nic_dynamic(cache_nic_dynamic, cache_nic_static, cache_nic_count);
     fprintf(stderr, "bmc: nics: %d devices\n", cache_nic_count);
     for (int i = 0; i < cache_nic_count; i++)
         fprintf(stderr, "bmc:   [%d] %s %s %s\n", i,
@@ -619,7 +619,7 @@ int bmc_update(uint64_t uptime_usec)
     /* Check for network changes via platform-specific detection */
     if (detect_network_changes() > 0) {
         fprintf(stderr, "bmc: network change detected\n");
-        collect_nic_dynamic(cache_nic_dynamic, cache_nic_count);
+        collect_nic_dynamic(cache_nic_dynamic, cache_nic_static, cache_nic_count);
     }
 
     /* Resend everything with fresh uptime */

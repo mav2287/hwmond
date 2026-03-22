@@ -106,9 +106,10 @@ int collect_nic_static(nic_static_t *nics, int max_nics);
 
 /*
  * Collect per-NIC dynamic info (IP, link, speed, duplex).
- * nic_count: number of NICs from collect_nic_static.
+ * Uses NIC names from the static array to query the correct interfaces.
  */
-int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count);
+int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
+                        int nic_count);
 
 /*
  * Check if drive configuration changed since last call.

@@ -451,7 +451,7 @@ int collect_nic_static(nic_static_t *nics, int max_nics)
     return count;
 }
 
-int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
+int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static, int nic_count)
 {
     /* Link state, speed, duplex from NIC list */
     FILE *fp = popen("/bin/esxcli network nic list 2>/dev/null", "r");
@@ -467,12 +467,12 @@ int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
                    name, pci, driver, admin, link, &speed, duplex_str, mac) >= 8
             && strncmp(name, "vmnic", 5) == 0
             && idx < nic_count) {
-            memset(&nics[idx], 0, sizeof(nics[idx]));
-            strncpy(nics[idx].link,
+            memset(&dynamic[idx], 0, sizeof(dynamic[idx]));
+            strncpy(dynamic[idx].link,
                     (strcmp(link, "Up") == 0) ? "active" : "inactive",
-                    sizeof(nics[idx].link) - 1);
-            snprintf(nics[idx].mbps, sizeof(nics[idx].mbps), "%d", speed);
-            strncpy(nics[idx].duplex, duplex_str, 7);
+                    sizeof(dynamic[idx].link) - 1);
+            snprintf(dynamic[idx].mbps, sizeof(dynamic[idx].mbps), "%d", speed);
+            strncpy(dynamic[idx].duplex, duplex_str, 7);
             idx++;
         }
     }
@@ -487,8 +487,8 @@ int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
                 if (strncmp(iface, "vmk", 3) == 0) {
                     int vmk_idx = atoi(iface + 3);
                     if (vmk_idx >= 0 && vmk_idx < nic_count) {
-                        strncpy(nics[vmk_idx].ipv4, ip, 19);
-                        strncpy(nics[vmk_idx].netmask, mask, 19);
+                        strncpy(dynamic[vmk_idx].ipv4, ip, 19);
+                        strncpy(dynamic[vmk_idx].netmask, mask, 19);
                     }
                 }
             }

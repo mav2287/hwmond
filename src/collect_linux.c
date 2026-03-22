@@ -109,7 +109,6 @@ int collect_system_info(system_info_t *info)
             char line[256];
             int max_pkg = -1;
             int cores_per_pkg = 0;
-            float mhz = 0;
 
             while (fgets(line, sizeof(line), fp)) {
                 if (strncmp(line, "model name", 10) == 0 && !info->cpu_model[0]) {
@@ -119,12 +118,35 @@ int collect_system_info(system_info_t *info)
                         while (*p == ' ') p++;
                         int l = strlen(p);
                         while (l > 0 && (p[l-1]=='\n'||p[l-1]=='\r')) p[--l]='\0';
-                        /* Strip "@ X.XX GHz" suffix */
+                        /* Collapse multiple spaces (Apple SMBIOS has them) */
+                        char *src = p, *dst = p;
+                        int prev_space = 0;
+                        while (*src) {
+                            if (*src == ' ') {
+                                if (!prev_space) *dst++ = ' ';
+                                prev_space = 1;
+                            } else {
+                                *dst++ = *src;
+                                prev_space = 0;
+                            }
+                            src++;
+                        }
+                        *dst = '\0';
+                        /* Strip "@ X.XX GHz" suffix — SM shows speed from binary */
                         char *at = strstr(p, " @");
                         if (at) *at = '\0';
                         l = strlen(p);
                         while (l > 0 && p[l-1] == ' ') p[--l] = '\0';
                         strncpy(info->cpu_model, p, CACHE_SIZE - 1);
+
+                        /* Extract MAX speed from the "@ X.XX GHz" we just stripped */
+                        if (at) {
+                            char *ghz = at + 2;
+                            while (*ghz == ' ') ghz++;
+                            float fghz = atof(ghz);
+                            if (fghz > 0)
+                                info->cpu_speed_mhz = (int)((fghz * 1000 + 5) / 10) * 10;
+                        }
                     }
                 }
                 else if (strncmp(line, "physical id", 11) == 0) {
@@ -138,10 +160,6 @@ int collect_system_info(system_info_t *info)
                     char *p = strchr(line, ':');
                     if (p) cores_per_pkg = atoi(p + 1);
                 }
-                else if (strncmp(line, "cpu MHz", 7) == 0 && mhz == 0) {
-                    char *p = strchr(line, ':');
-                    if (p) mhz = atof(p + 1);
-                }
             }
             fclose(fp);
 
@@ -149,7 +167,35 @@ int collect_system_info(system_info_t *info)
             if (info->cpu_packages <= 0) info->cpu_packages = 1;
             info->cpu_cores = cores_per_pkg * info->cpu_packages;
             if (info->cpu_cores <= 0) info->cpu_cores = 1;
-            info->cpu_speed_mhz = (int)((mhz + 5) / 10) * 10;
+
+            /* If speed wasn't found from model name, try lscpu */
+            if (info->cpu_speed_mhz <= 0) {
+                FILE *fp2 = popen("lscpu 2>/dev/null | grep 'CPU max MHz'", "r");
+                if (fp2) {
+                    char buf[128];
+                    if (fgets(buf, sizeof(buf), fp2)) {
+                        char *p = strchr(buf, ':');
+                        if (p) info->cpu_speed_mhz = (int)(atof(p + 1) + 0.5);
+                    }
+                    pclose(fp2);
+                }
+            }
+            /* Last resort: current frequency (may be power-saving reduced) */
+            if (info->cpu_speed_mhz <= 0) {
+                fp = fopen("/proc/cpuinfo", "r");
+                if (fp) {
+                    while (fgets(line, sizeof(line), fp)) {
+                        if (strncmp(line, "cpu MHz", 7) == 0) {
+                            char *p = strchr(line, ':');
+                            if (p) {
+                                info->cpu_speed_mhz = (int)(atof(p + 1) + 0.5);
+                                break;
+                            }
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
         }
     }
 
@@ -314,37 +360,28 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
 {
     int count = 0;
 
-    FILE *fp = popen("lsblk -d -n -b -o NAME,SIZE,MODEL,VENDOR,TRAN,ROTA 2>/dev/null", "r");
-    if (!fp) return 0;
+    /* Scan /sys/block/ directly — more reliable than parsing lsblk */
+    DIR *dir = opendir("/sys/block");
+    if (!dir) return 0;
 
-    char line[512];
-    while (fgets(line, sizeof(line), fp) && count < max_drives) {
-        char name[32] = "";
-        long long size_bytes = 0;
-        int rota = 1;
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL && count < max_drives) {
+        char *name = ent->d_name;
+        char sysname[128];
 
-        /* Parse space-delimited fields — lsblk right-pads with spaces */
-        char *fields[6];
-        char *tok = line;
-        int fi = 0;
-        while (fi < 6 && tok && *tok) {
-            while (*tok == ' ') tok++;
-            if (!*tok) break;
-            fields[fi] = tok;
-            while (*tok && *tok != ' ' && *tok != '\n') tok++;
-            if (*tok) { *tok = '\0'; tok++; }
-            fi++;
-        }
-        /* lsblk -b output varies. Use simpler parsing */
-        if (fi < 2) continue;
-
-        /* Actually, let's use a more reliable approach */
-        char sysname[64];
-        if (sscanf(line, "%31s", name) != 1) continue;
-
-        /* Skip loop, ram, rom devices */
-        if (strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0)
+        /* Only real block devices: sd*, nvme*, hd* */
+        if (strncmp(name, "sd", 2) != 0 &&
+            strncmp(name, "nvme", 4) != 0 &&
+            strncmp(name, "hd", 2) != 0)
             continue;
+
+        /* Skip partitions (nvme0n1p1, sda1) */
+        {
+            int nlen = strlen(name);
+            if (nlen > 0 && name[nlen-1] >= '0' && name[nlen-1] <= '9' &&
+                strstr(name, "n1p"))
+                continue;
+        }
 
         drive_info_t *d = &drives[count];
         memset(d, 0, sizeof(*d));
@@ -355,28 +392,29 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
             char sbuf[32];
             if (read_file_trimmed(sysname, sbuf, sizeof(sbuf)) > 0) {
                 long long sectors = atoll(sbuf);
-                size_bytes = sectors * 512;
-                d->capacity_mb = (uint32_t)(size_bytes / (1024LL * 1024));
+                d->capacity_mb = (uint32_t)(sectors / 2048); /* sectors/2048 = MB */
             }
         }
 
         if (d->capacity_mb == 0) continue;  /* Skip zero-size devices */
 
-        /* Model from /sys/block/DEV/device/model */
-        snprintf(sysname, sizeof(sysname), "/sys/block/%s/device/model", name);
-        read_file_trimmed(sysname, d->model, sizeof(d->model));
+        /* Model — NVMe uses a different sysfs path */
+        if (strncmp(name, "nvme", 4) == 0) {
+            snprintf(sysname, sizeof(sysname), "/sys/block/%s/device/model", name);
+            read_file_trimmed(sysname, d->model, sizeof(d->model));
+        } else {
+            snprintf(sysname, sizeof(sysname), "/sys/block/%s/device/model", name);
+            read_file_trimmed(sysname, d->model, sizeof(d->model));
+        }
 
-        /* Vendor from /sys/block/DEV/device/vendor */
+        /* Vendor */
         snprintf(sysname, sizeof(sysname), "/sys/block/%s/device/vendor", name);
         read_file_trimmed(sysname, d->vendor, sizeof(d->vendor));
-        /* Clean up "ATA     " padding */
         {
             int vl = strlen(d->vendor);
             while (vl > 0 && d->vendor[vl-1] == ' ') d->vendor[--vl] = '\0';
             if (strcmp(d->vendor, "ATA") == 0) d->vendor[0] = '\0';
         }
-
-        /* Fallback vendor from model first word */
         if (!d->vendor[0] && d->model[0]) {
             char *sp = strchr(d->model, ' ');
             if (sp && (sp - d->model) >= 2 && (sp - d->model) < 20) {
@@ -386,6 +424,7 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
         }
 
         /* SSD/HDD from rotational flag */
+        int rota = 1;
         snprintf(sysname, sizeof(sysname), "/sys/block/%s/queue/rotational", name);
         {
             char rbuf[8];
@@ -394,11 +433,10 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
         }
         strncpy(d->kind, rota ? "HDD" : "SSD", 7);
 
-        /* Transport from /sys/block/DEV/device/transport or name prefix */
+        /* Transport */
         if (strncmp(name, "nvme", 4) == 0)
             strncpy(d->iface, "NVMe", 15);
         else {
-            /* Try /sys path or default to SATA */
             snprintf(sysname, sizeof(sysname),
                      "/sys/block/%s/device/transport", name);
             char tbuf[16] = "";
@@ -407,21 +445,17 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
                 strncpy(d->iface, "SAS", 15);
             else if (strstr(tbuf, "sata") || strstr(tbuf, "ata"))
                 strncpy(d->iface, "SATA", 15);
-            else if (strncmp(name, "sd", 2) == 0)
-                strncpy(d->iface, "SATA", 15);  /* default for sd* */
             else
-                strncpy(d->iface, "SCSI", 15);
+                strncpy(d->iface, "SATA", 15);
         }
 
         snprintf(d->location, sizeof(d->location), "Bay %d", count + 1);
-
         int gb = (int)(d->capacity_mb / 1024);
         snprintf(d->display, sizeof(d->display), "%s %dG %s",
                  d->model, gb, d->kind);
-
         count++;
     }
-    pclose(fp);
+    closedir(dir);
     return count;
 }
 
@@ -482,61 +516,32 @@ int collect_nic_static(nic_static_t *nics, int max_nics)
     return count;
 }
 
-int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
+int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
+                        int nic_count)
 {
     for (int i = 0; i < nic_count; i++) {
-        /* Actually we need the name from nic_static. The caller must match indices. */
-        /* For now, we'll read from /sys using the index order */
-
-        memset(&nics[i], 0, sizeof(nics[i]));
-    }
-
-    /* Re-read NIC info from /sys */
-    DIR *dir = opendir("/sys/class/net");
-    if (!dir) return -1;
-
-    struct dirent *ent;
-    int idx = 0;
-    while ((ent = readdir(dir)) != NULL && idx < nic_count) {
-        char *name = ent->d_name;
-        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 ||
-            strcmp(name, "lo") == 0 ||
-            strncmp(name, "veth", 4) == 0 ||
-            strncmp(name, "br-", 3) == 0 ||
-            strncmp(name, "docker", 6) == 0 ||
-            strncmp(name, "vmbr", 4) == 0 ||
-            strncmp(name, "tap", 3) == 0 ||
-            strncmp(name, "bond", 4) == 0 ||
-            strncmp(name, "fwbr", 4) == 0 ||
-            strncmp(name, "fwpr", 4) == 0 ||
-            strncmp(name, "fwln", 4) == 0)
-            continue;
-
-        char devpath[128];
-        snprintf(devpath, sizeof(devpath), "/sys/class/net/%s/device", name);
-        struct stat st;
-        if (stat(devpath, &st) != 0) continue;
-
+        memset(&dynamic[i], 0, sizeof(dynamic[i]));
+        const char *name = nics_static[i].name;
         char path[128], buf[32];
 
         /* Link state */
         snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", name);
         read_file_trimmed(path, buf, sizeof(buf));
-        strncpy(nics[idx].link,
+        strncpy(dynamic[i].link,
                 (strcmp(buf, "up") == 0) ? "active" : "inactive",
-                sizeof(nics[idx].link) - 1);
+                sizeof(dynamic[i].link) - 1);
 
         /* Speed */
         snprintf(path, sizeof(path), "/sys/class/net/%s/speed", name);
         if (read_file_trimmed(path, buf, sizeof(buf)) > 0 && atoi(buf) > 0)
-            strncpy(nics[idx].mbps, buf, sizeof(nics[idx].mbps) - 1);
+            strncpy(dynamic[i].mbps, buf, sizeof(dynamic[i].mbps) - 1);
 
         /* Duplex */
         snprintf(path, sizeof(path), "/sys/class/net/%s/duplex", name);
         if (read_file_trimmed(path, buf, sizeof(buf)) > 0)
-            strncpy(nics[idx].duplex, buf, sizeof(nics[idx].duplex) - 1);
+            strncpy(dynamic[i].duplex, buf, sizeof(dynamic[i].duplex) - 1);
 
-        /* IP address — parse 'ip addr show DEV' */
+        /* IP address from 'ip addr show DEV' */
         {
             char cmd[128];
             snprintf(cmd, sizeof(cmd), "ip -4 addr show %s 2>/dev/null | grep inet", name);
@@ -544,21 +549,17 @@ int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
             if (fp) {
                 char ipline[256];
                 if (fgets(ipline, sizeof(ipline), fp)) {
-                    /* Format: "    inet 192.168.1.100/24 ..." */
                     char *p = strstr(ipline, "inet ");
                     if (p) {
                         p += 5;
-                        /* Extract IP (before /) */
                         char *slash = strchr(p, '/');
                         if (slash) {
                             int iplen = slash - p;
-                            if (iplen < (int)sizeof(nics[idx].ipv4))
-                                strncpy(nics[idx].ipv4, p, iplen);
-
-                            /* Extract netmask from prefix length */
+                            if (iplen < (int)sizeof(dynamic[i].ipv4))
+                                strncpy(dynamic[i].ipv4, p, iplen);
                             int prefix = atoi(slash + 1);
                             uint32_t mask = prefix ? (~0U << (32 - prefix)) : 0;
-                            snprintf(nics[idx].netmask, sizeof(nics[idx].netmask),
+                            snprintf(dynamic[i].netmask, sizeof(dynamic[i].netmask),
                                      "%d.%d.%d.%d",
                                      (mask >> 24) & 0xFF, (mask >> 16) & 0xFF,
                                      (mask >> 8) & 0xFF, mask & 0xFF);
@@ -568,10 +569,7 @@ int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
                 pclose(fp);
             }
         }
-
-        idx++;
     }
-    closedir(dir);
     return 0;
 }
 
