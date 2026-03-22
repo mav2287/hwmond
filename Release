@@ -3,12 +3,8 @@ Label: hwmond
 Suite: stable
 Codename: stable
 Architectures: amd64
-Components: .
-Description: Apple Xserve hardware monitor for Linux
-Date: Sun, 22 Mar 2026 04:53:16 UTC
-MD5Sum:
- d49f61cb4224a549b2efdd22098c1f1e 566 Packages
- b9e36955d54b7dada9c0ec1e03898624 414 Packages.gz
+Components: main
+Date: Sun, 22 Mar 2026 05:00:47 UTC
 SHA256:
- 9a02bb98ff877cabf7165bf67ae57c05db0f7e768cca3b5d2a5c98b4c2af47a8 566 Packages
- 71c5fce09ffa7bef3eedab0a1bacb8f40baea4664a4863f0ffe9a21b05a02f31 414 Packages.gz
+ 8a3d1ca8404f7886db308400517fdd6201ae8851d6faa5b401b48d7687e716e8 565 Packages
+ c50e2fc1c120ca73e5e70bc7b5053ab327ad223edae1e98385318a07dfe56f3d 413 Packages.gz
