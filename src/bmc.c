@@ -449,6 +449,30 @@ static void send_all_cached(uint32_t uptime_secs)
 
 int bmc_init(void)
 {
+    /* Verify this is Apple Xserve hardware before touching the BMC.
+     * Apple OEM IPMI commands (NetFn 0x36) and the KCS port config
+     * could damage non-Apple BMCs (Dell iDRAC, HP iLO, etc.). */
+    {
+        char model[128] = "";
+        FILE *fp = fopen("/sys/class/dmi/id/product_name", "r");
+        if (fp) {
+            if (fgets(model, sizeof(model), fp)) {
+                int l = strlen(model);
+                while (l > 0 && (model[l-1]=='\n'||model[l-1]==' '))
+                    model[--l] = '\0';
+            }
+            fclose(fp);
+        }
+        if (strstr(model, "Xserve") == NULL) {
+            fprintf(stderr, "bmc: not Apple Xserve hardware (model: %s)\n",
+                    model[0] ? model : "unknown");
+            fprintf(stderr, "bmc: BMC data population disabled "
+                    "(Apple OEM IPMI is Xserve-only)\n");
+            return -1;
+        }
+        fprintf(stderr, "bmc: hardware verified: %s\n", model);
+    }
+
     /* Check if IPMI is available (don't hold fd open) */
     int test_fd = open("/dev/ipmi0", O_RDWR);
     if (test_fd < 0) {

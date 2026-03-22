@@ -472,8 +472,76 @@ static void print_usage(const char *prog)
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Verify this is Apple Xserve hardware (1,1 / 2,1 / 3,1).
+ * hwmond uses Apple-specific USB hardware, Apple OEM IPMI commands,
+ * and Apple KCS port addresses. Running on non-Xserve hardware
+ * would at best do nothing, at worst damage a non-Apple BMC.
+ */
+static int verify_xserve_hardware(void)
+{
+    const char *paths[] = {
+        "/sys/class/dmi/id/product_name",  /* Linux */
+        NULL
+    };
+    char model[128] = "";
+
+    for (int i = 0; paths[i]; i++) {
+        FILE *fp = fopen(paths[i], "r");
+        if (fp) {
+            if (fgets(model, sizeof(model), fp)) {
+                int l = strlen(model);
+                while (l > 0 && (model[l-1]=='\n'||model[l-1]==' '))
+                    model[--l] = '\0';
+            }
+            fclose(fp);
+            break;
+        }
+    }
+
+#ifdef __ESXI__
+    /* On ESXi, /sys doesn't exist. Check via esxcli. */
+    if (!model[0]) {
+        FILE *fp = popen("/bin/esxcli hardware platform get 2>/dev/null", "r");
+        if (fp) {
+            char line[256];
+            while (fgets(line, sizeof(line), fp)) {
+                if (strstr(line, "Product Name")) {
+                    char *p = strchr(line, ':');
+                    if (p) {
+                        p++;
+                        while (*p == ' ') p++;
+                        int l = strlen(p);
+                        while (l > 0 && (p[l-1]=='\n'||p[l-1]==' '))
+                            p[--l] = '\0';
+                        strncpy(model, p, sizeof(model) - 1);
+                    }
+                }
+            }
+            pclose(fp);
+        }
+    }
+#endif
+
+    if (strstr(model, "Xserve") != NULL)
+        return 0;  /* Xserve 1,1 / 2,1 / 3,1 — all contain "Xserve" */
+
+    fprintf(stderr,
+        "hwmond: ERROR — this is NOT Apple Xserve hardware.\n"
+        "  Detected: %s\n"
+        "  hwmond is designed exclusively for Apple Xserve (1,1 / 2,1 / 3,1).\n"
+        "  Running on other hardware could damage the BMC.\n"
+        "  Exiting.\n",
+        model[0] ? model : "unknown");
+    return -1;
+}
+
 int main(int argc, char *argv[])
 {
+    /* Hard block on non-Xserve hardware */
+    if (verify_xserve_hardware() < 0)
+        return 1;
+
     int daemon_mode = 0;
     int test_mode = 0;
     const char *pidfile = "/var/run/hwmond.pid";
