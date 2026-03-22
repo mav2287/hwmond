@@ -11,7 +11,7 @@ VIB_FILE     = $(BUILD_DIR)/hwmond-xserve.vib
 DEB_FILE     = $(BUILD_DIR)/hwmond-xserve-3.0.0.deb
 
 # ESXi source files
-ESXI_SRC = src/main.c src/panel_usb.c src/cpu_usage.c src/bmc.c
+ESXI_SRC = src/main.c src/panel_usb.c src/cpu_usage.c src/collect_esxi.c src/bmc.c
 # Linux source files
 LINUX_SRC = src/main.c src/panel_usb.c src/cpu_linux.c src/collect_linux.c src/bmc.c
 

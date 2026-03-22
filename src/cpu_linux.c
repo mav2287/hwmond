@@ -37,8 +37,6 @@ static int detect_topology(cpu_state_t *state)
     int current_cpu = -1;
     int max_pkg = -1;
     int cores_per_pkg = 0;
-    int total_cores = 0;
-
     memset(pcpu_to_package, 0, sizeof(pcpu_to_package));
 
     while (fgets(line, sizeof(line), fp)) {
@@ -60,26 +58,12 @@ static int detect_topology(cpu_state_t *state)
             char *p = strchr(line, ':');
             if (p) cores_per_pkg = atoi(p + 1);
         }
-        else if (strncmp(line, "model name", 10) == 0 && state->cpu_model[0] == '\0') {
-            char *p = strchr(line, ':');
-            if (p) {
-                p++;
-                while (*p == ' ') p++;
-                int l = strlen(p);
-                while (l > 0 && (p[l-1] == '\n' || p[l-1] == '\r'))
-                    p[--l] = '\0';
-                strncpy(state->cpu_model, p, sizeof(state->cpu_model) - 1);
-            }
-        }
     }
     fclose(fp);
 
     num_packages = max_pkg + 1;
     if (num_packages <= 0) num_packages = 1;
     if (num_pcpus <= 0) num_pcpus = 1;
-
-    total_cores = cores_per_pkg * num_packages;
-    if (total_cores <= 0) total_cores = num_pcpus;
 
     state->num_packages = num_packages;
     state->num_threads = num_pcpus;
@@ -211,4 +195,10 @@ int cpu_sample(cpu_state_t *state)
 {
     sleep(1);
     return read_proc_stat(state);
+}
+
+void cpu_shutdown(cpu_state_t *state)
+{
+    (void)state;
+    /* Nothing to clean up on Linux — /proc/stat doesn't need closing */
 }

@@ -1,5 +1,5 @@
 /*
- * bmc.c - Apple BMC/IPMI data population for Xserve on ESXi
+ * bmc.c - Apple BMC/IPMI data population for Xserve
  *
  * Populates the Xserve BMC with system information using Apple's
  * OEM IPMI protocol:
@@ -10,11 +10,9 @@
  *   First block: [param, offset, block=0, len_lo, len_hi, data...]
  *   Next blocks: [param, offset, block=N, data...]
  *
- * Strategy:
- *   - At startup: query all data via popen, cache it, send to BMC
- *   - Every 60 seconds: resend all cached data + fresh uptime
- *   - stat() drives/network dirs to detect changes (re-query only if needed)
- *   - Uptime comes free from the CPU thread's elapsed-time (zero cost)
+ * Platform-independent: data collection is handled by collect_esxi.c
+ * or collect_linux.c via the collect.h interface. This file only
+ * handles IPMI protocol and BMC parameter formatting.
  */
 
 #define _GNU_SOURCE
@@ -30,6 +28,7 @@
 #include <time.h>
 #include <poll.h>
 #include "bmc.h"
+#include "collect.h"
 
 /* ------------------------------------------------------------------ */
 /*  IPMI device interface                                              */
@@ -272,430 +271,22 @@ static int set_strings(uint8_t param, uint8_t set_sel,
 }
 
 /* ------------------------------------------------------------------ */
-/*  ESXi data collection helpers                                       */
+/*  Cached data from platform-specific collection                      */
 /* ------------------------------------------------------------------ */
 
-static int popen_field(const char *cmd, const char *field,
-                       char *buf, int bufsz)
-{
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    char line[512];
-    buf[0] = '\0';
-    while (fgets(line, sizeof(line), fp)) {
-        char *p = strstr(line, field);
-        if (p) {
-            p += strlen(field);
-            while (*p == ' ' || *p == ':') p++;
-            int len = strlen(p);
-            while (len > 0 && (p[len-1] == '\n' || p[len-1] == '\r'
-                               || p[len-1] == ' '))
-                p[--len] = '\0';
-            strncpy(buf, p, bufsz - 1);
-            buf[bufsz - 1] = '\0';
-            pclose(fp);
-            return strlen(buf);
-        }
-    }
-    pclose(fp);
-    return -1;
-}
-
-static int popen_line(const char *cmd, char *buf, int bufsz)
-{
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return -1;
-    buf[0] = '\0';
-    if (fgets(buf, bufsz, fp)) {
-        int len = strlen(buf);
-        while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
-            buf[--len] = '\0';
-    }
-    pclose(fp);
-    return strlen(buf);
-}
-
-static void collapse_spaces(char *str)
-{
-    char *src = str, *dst = str;
-    int prev_space = 1;
-    while (*src) {
-        if (*src == ' ') {
-            if (!prev_space) *dst++ = ' ';
-            prev_space = 1;
-        } else {
-            *dst++ = *src;
-            prev_space = 0;
-        }
-        src++;
-    }
-    if (dst > str && *(dst-1) == ' ') dst--;
-    *dst = '\0';
-}
+static system_info_t cache_sysinfo;
+static dimm_info_t   cache_dimms[MAX_DIMMS];
+static int           cache_dimm_count = 0;
+static drive_info_t  cache_drives[MAX_DRIVES];
+static int           cache_drive_count = 0;
+static nic_static_t  cache_nic_static[MAX_NICS];
+static int           cache_nic_count = 0;
+static nic_dynamic_t cache_nic_dynamic[MAX_NICS];
+static uint8_t       cache_cpu[12];
 
 /* ------------------------------------------------------------------ */
-/*  Cached BMC data                                                    */
+/*  send_all_cached — write all parameters to BMC                      */
 /* ------------------------------------------------------------------ */
-
-/* Max cached string size */
-#define CACHE_SIZE 256
-
-static char cache_firmware[CACHE_SIZE];
-static char cache_hostname[CACHE_SIZE];
-static char cache_fqdn[CACHE_SIZE];
-
-/* 0x03/0x04 OS info — 3 strings each: [product, version, build] */
-static char cache_os_product[CACHE_SIZE];  /* "VMware ESXi" */
-static char cache_os_version[CACHE_SIZE];  /* "6.5.0" */
-static char cache_os_update[CACHE_SIZE];   /* "Update 3" */
-static char cache_os_build[CACHE_SIZE];    /* "Build 8294253" or "U3 P169" */
-
-/* String caches */
-static char cache_cpu_model[CACHE_SIZE]; /* CPU model name for 0xC0 string */
-static char cache_serial[CACHE_SIZE];    /* Serial for 0xC1 string 2 */
-static char cache_model[CACHE_SIZE];     /* Model for 0xC1 string 1 */
-static uint32_t cache_total_ram_mb;      /* Total RAM in MB for 0xC1 binary */
-
-/*
- * 0xC2 MemoryInfo per DIMM (reverse-engineered from Server Monitor):
- * Binary (6 bytes): [config_type, ecc_type, size_mb(uint32 LE)]
- *   config_type: 0x00 = populated (SM skips non-zero when firmware_supports_extra=false)
- *   ecc_type:    0x00 = no ECC display, 0x02 = show ECC error count
- * Strings (3): Slot name, Speed, Type
- *
- * 0xC9 MemoryDynamicInfo per DIMM:
- * Binary (16 bytes): 4 x uint32 LE [summary, parity_count, parity_baseline, reserved]
- *   Apple's hwmond writes this for ECC error reporting.
- */
-#define MAX_DIMMS 16
-struct dimm_info {
-    uint8_t  config_type; /* 0x00 = populated */
-    uint8_t  ecc_type;    /* 0x00 = no ECC display */
-    uint32_t size_mb;
-    char     slot_name[32]; /* e.g. "DIMM 1" */
-    char     speed[16];     /* e.g. "1066 MHz" */
-    char     type[16];      /* e.g. "DDR3 ECC" */
-};
-static struct dimm_info cache_dimms[MAX_DIMMS];
-static int cache_dimm_count = 0;
-
-/* 0xC3 DriveStaticInfo per drive: 8 bytes binary (uint64 capacity) */
-#define MAX_DRIVES 8
-struct drive_info {
-    uint32_t capacity_mb;  /* SM reads bytes 0-3 as int32 via numberWithInt: */
-    uint32_t reserved;     /* bytes 4-7: must be 0 (was being read as bay#) */
-};
-static struct drive_info cache_drive_binary[MAX_DRIVES];
-static char cache_drive_model[MAX_DRIVES][32];
-static char cache_drive_kind[MAX_DRIVES][8];      /* "SSD" or "HDD" */
-static char cache_drive_iface[MAX_DRIVES][16];    /* "SATA", "SAS" */
-static char cache_drive_vendor[MAX_DRIVES][32];   /* Manufacturer */
-static char cache_drive_location[MAX_DRIVES][16]; /* "Bay 1", "Bay 2" */
-static uint8_t cache_cpu[12];
-
-/* Change detection */
-static time_t network_mtime = 0;
-static int    drive_count = 0;
-
-/* Count entries in /vmfs/devices/disks/ — only changes on add/remove */
-static int count_disk_devices(void)
-{
-    FILE *fp = popen("ls /vmfs/devices/disks/ 2>/dev/null | wc -l", "r");
-    if (!fp) return -1;
-    char buf[32];
-    int count = 0;
-    if (fgets(buf, sizeof(buf), fp))
-        count = atoi(buf);
-    pclose(fp);
-    return count;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Data collection functions                                          */
-/* ------------------------------------------------------------------ */
-
-/*
- * Collect per-drive data and write each as a separate set_selector.
- * Format per drive (max 30 bytes):
- *   "Model SizeG Type"
- *   e.g. "Samsung SSD 970 1863G SSD"
- */
-static char cache_drive_entries[MAX_DRIVES][32];
-static int  cache_drive_count = 0;
-
-static void collect_drives(void)
-{
-    FILE *fp = popen("/bin/esxcli storage core device list 2>/dev/null", "r");
-    if (!fp) return;
-
-    char line[512];
-    char dev_id[256] = "", model[64] = "", size_str[32] = "";
-    char vendor[32] = "", is_ssd[8] = "", is_sas[8] = "";
-    char dev_type[32] = "", display_name[128] = "";
-    cache_drive_count = 0;
-
-    /* Helper: save the currently-accumulated device as a drive entry */
-    int have_device = 0;
-
-    while (1) {
-        int got_line = (fgets(line, sizeof(line), fp) != NULL);
-        char *p;
-        int l;
-
-        /* At EOF or new device ID line: save previous device */
-        int new_device = (!got_line) ||
-            (line[0] != ' ' && line[0] != '\n' && line[0] != '-' &&
-             strlen(line) > 3);
-
-        if (new_device && have_device) {
-            /* Save if it's a valid Direct-Access device with size */
-            if (model[0] && atol(size_str) > 0 &&
-                strstr(dev_type, "Direct") &&
-                cache_drive_count < MAX_DRIVES) {
-                long mb = atol(size_str);
-                int idx = cache_drive_count;
-
-                cache_drive_binary[idx].capacity_mb = (uint32_t)mb;
-                cache_drive_binary[idx].reserved = 0;
-
-                strncpy(cache_drive_kind[idx],
-                        strstr(is_ssd, "true") ? "SSD" : "HDD", 7);
-                strncpy(cache_drive_model[idx], model, 31);
-
-                /* Manufacturer from multiple sources */
-                cache_drive_vendor[idx][0] = '\0';
-                if (vendor[0] && strcmp(vendor, "ATA") != 0 &&
-                    strcmp(vendor, "NVMe") != 0)
-                    strncpy(cache_drive_vendor[idx], vendor, 31);
-                if (!cache_drive_vendor[idx][0] &&
-                    strncmp(dev_id, "t10.", 4) == 0) {
-                    char *s = dev_id + 4;
-                    while (*s && *s != '_') s++;
-                    while (*s == '_') s++;
-                    if (*s) {
-                        char *e = s;
-                        while (*e && *e != '_' && *e != ' ') e++;
-                        int wl = e - s;
-                        if (wl >= 2 && wl < 30) {
-                            strncpy(cache_drive_vendor[idx], s, wl);
-                            cache_drive_vendor[idx][wl] = '\0';
-                        }
-                    }
-                }
-                if (!cache_drive_vendor[idx][0] && display_name[0] &&
-                    strncmp(display_name, "Local", 5) != 0) {
-                    char *sp = strchr(display_name, ' ');
-                    if (sp && (sp - display_name) >= 2 &&
-                        (sp - display_name) < 30) {
-                        strncpy(cache_drive_vendor[idx], display_name,
-                                sp - display_name);
-                        cache_drive_vendor[idx][sp - display_name] = '\0';
-                    }
-                }
-                if (!cache_drive_vendor[idx][0]) {
-                    char *sp = strchr(model, ' ');
-                    if (sp && (sp - model) >= 2 && (sp - model) < 20) {
-                        strncpy(cache_drive_vendor[idx], model, sp - model);
-                        cache_drive_vendor[idx][sp - model] = '\0';
-                    }
-                }
-
-                /* Interconnect — now reads Is SAS correctly */
-                if (strstr(dev_id, "NVMe") || strstr(dev_id, "nvme"))
-                    strncpy(cache_drive_iface[idx], "NVMe", 15);
-                else if (strstr(display_name, "Fibre Channel"))
-                    strncpy(cache_drive_iface[idx], "Fibre Channel", 15);
-                else if (strstr(is_sas, "true"))
-                    strncpy(cache_drive_iface[idx], "SAS", 15);
-                else
-                    strncpy(cache_drive_iface[idx], "SATA", 15);
-
-                snprintf(cache_drive_location[idx],
-                         sizeof(cache_drive_location[idx]),
-                         "Bay %d", idx + 1);
-
-                int gb = (int)(mb / 1024);
-                snprintf(cache_drive_entries[idx], 31,
-                         "%s %dG %s", model, gb,
-                         strstr(is_ssd, "true") ? "SSD" : "HDD");
-                cache_drive_entries[idx][31] = '\0';
-                cache_drive_count++;
-            }
-
-            /* Reset for next device */
-            dev_id[0] = model[0] = size_str[0] = '\0';
-            vendor[0] = is_ssd[0] = is_sas[0] = '\0';
-            dev_type[0] = display_name[0] = '\0';
-            have_device = 0;
-        }
-
-        if (!got_line) break;
-
-        /* Parse current line */
-        if (line[0] != ' ' && line[0] != '\n' && line[0] != '-') {
-            l = strlen(line);
-            while (l > 0 && (line[l-1] == '\n' || line[l-1] == ' '))
-                line[--l] = '\0';
-            strncpy(dev_id, line, sizeof(dev_id) - 1);
-            have_device = 1;
-        } else if ((p = strstr(line, "Display Name:")) != NULL &&
-                   !strstr(line, "Settable")) {
-            p += 13; while (*p == ' ') p++;
-            l = strlen(p);
-            while (l > 0 && (p[l-1]=='\n'||p[l-1]==' ')) p[--l]='\0';
-            strncpy(display_name, p, sizeof(display_name) - 1);
-        } else if ((p = strstr(line, "Model:")) != NULL &&
-                   !strstr(line, "Multipath")) {
-            p += 6; while (*p == ' ') p++;
-            l = strlen(p);
-            while (l > 0 && (p[l-1]=='\n'||p[l-1]==' ')) p[--l]='\0';
-            strncpy(model, p, sizeof(model) - 1);
-        } else if ((p = strstr(line, "Vendor:")) != NULL) {
-            p += 7; while (*p == ' ') p++;
-            l = strlen(p);
-            while (l > 0 && (p[l-1]=='\n'||p[l-1]==' ')) p[--l]='\0';
-            strncpy(vendor, p, sizeof(vendor) - 1);
-        } else if ((p = strstr(line, "Device Type:")) != NULL) {
-            p += 12; while (*p == ' ') p++;
-            l = strlen(p);
-            while (l > 0 && (p[l-1]=='\n'||p[l-1]==' ')) p[--l]='\0';
-            strncpy(dev_type, p, sizeof(dev_type) - 1);
-        } else if (strstr(line, "  Size:") && !strstr(line, "Queue") &&
-                   !strstr(line, "Cache") && !strstr(line, "Sample")) {
-            p = strstr(line, "Size:") + 5;
-            while (*p == ' ') p++;
-            l = strlen(p);
-            while (l > 0 && (p[l-1]=='\n'||p[l-1]==' ')) p[--l]='\0';
-            strncpy(size_str, p, sizeof(size_str) - 1);
-        } else if ((p = strstr(line, "Is SAS:")) != NULL) {
-            p += 7; while (*p == ' ') p++;
-            strncpy(is_sas, p, 5); is_sas[5] = '\0';
-        } else if ((p = strstr(line, "Is SSD:")) != NULL) {
-            p += 7; while (*p == ' ') p++;
-            strncpy(is_ssd, p, 5); is_ssd[5] = '\0';
-        }
-    }
-    pclose(fp);
-}
-
-/*
- * NIC data. Each NIC gets its own set_selector.
- * 0xC4 (NetworkStaticInfo):  0 binary, 3 strings: [name, MAC, driver]
- * 0xC6 (NetworkDynamicInfo): 20 binary, 5 strings: [ip, netmask, gateway, dns1, dns2]
- */
-#define MAX_NICS 4
-
-struct nic_static {
-    char name[16];    /* e.g. "vmnic0" */
-    char mac[24];     /* e.g. "00:24:36:f4:06:4e" */
-    char driver[32];  /* e.g. "e1000e" */
-};
-static struct nic_static cache_nic_static[MAX_NICS];
-static int cache_nic_count = 0;
-
-static void collect_nics(void)
-{
-    FILE *fp = popen("/bin/esxcli network nic list 2>/dev/null", "r");
-    if (!fp) return;
-
-    char line[512];
-    cache_nic_count = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        char name[16], pci[16], driver[16], admin[8], link[8];
-        char duplex[8], mac[24];
-        int speed;
-        if (sscanf(line, "%15s %15s %15s %7s %7s %d %7s %23s",
-                   name, pci, driver, admin, link, &speed, duplex, mac) >= 8
-            && strncmp(name, "vmnic", 5) == 0
-            && cache_nic_count < MAX_NICS) {
-            strncpy(cache_nic_static[cache_nic_count].name, name, 15);
-            strncpy(cache_nic_static[cache_nic_count].mac, mac, 23);
-            strncpy(cache_nic_static[cache_nic_count].driver, driver, 31);
-            cache_nic_count++;
-        }
-    }
-    pclose(fp);
-}
-
-/*
- * 0xC6 NetworkDynamicInfo (reverse-engineered from Server Monitor):
- * Binary (5 x uint32 LE): [PacketsIn, PacketsOut, BytesIn, BytesOut, reserved]
- *   = traffic counters, NOT link/speed/duplex!
- * Strings (5): [IPAddress, SubNetMask, Link, Mbps, DuplexMode]
- *   Link, speed, and duplex are STRINGS (e.g. "Up", "1000", "Full")
- */
-struct net_dynamic {
-    /* Binary: traffic counters */
-    uint32_t packets_in;
-    uint32_t packets_out;
-    uint32_t bytes_in;
-    uint32_t bytes_out;
-    uint32_t reserved;
-    /* Strings */
-    char ipv4[20];        /* "192.168.1.100" */
-    char netmask[20];     /* "255.255.255.0" */
-    char link[16];        /* "CONNECTED" or "DISCONNECTED" */
-    char mbps[16];        /* "1000" */
-    char duplex[8];       /* "Full" or "Half" */
-};
-
-static struct net_dynamic cache_net_dynamic[MAX_NICS];
-
-static void collect_net_dynamic(void)
-{
-    /* Link state, speed, duplex from NIC list — these go in STRINGS */
-    FILE *fp = popen("/bin/esxcli network nic list 2>/dev/null", "r");
-    if (!fp) return;
-
-    char line[512];
-    int idx = 0;
-
-    while (fgets(line, sizeof(line), fp)) {
-        char name[16], pci[16], driver[16], admin[8], link[8];
-        char duplex_str[8], mac[24];
-        int speed;
-        if (sscanf(line, "%15s %15s %15s %7s %7s %d %7s %23s",
-                   name, pci, driver, admin, link, &speed, duplex_str, mac) >= 8
-            && strncmp(name, "vmnic", 5) == 0
-            && idx < MAX_NICS) {
-            /* Binary = traffic counters (zero at startup) */
-            memset(&cache_net_dynamic[idx], 0, sizeof(cache_net_dynamic[idx]));
-            /* Strings */
-            /* Server Monitor compares Link string against "active" for LINK-UP */
-            strncpy(cache_net_dynamic[idx].link,
-                    (strcmp(link, "Up") == 0) ? "active" : "inactive",
-                    sizeof(cache_net_dynamic[idx].link) - 1);
-            snprintf(cache_net_dynamic[idx].mbps, sizeof(cache_net_dynamic[idx].mbps),
-                     "%d", speed);
-            strncpy(cache_net_dynamic[idx].duplex, duplex_str, 7);
-            cache_net_dynamic[idx].ipv4[0] = '\0';
-            cache_net_dynamic[idx].netmask[0] = '\0';
-            idx++;
-        }
-    }
-    pclose(fp);
-
-    /* Get IP addresses from vmkernel interfaces.
-     * Map vmk* IPs to the first NIC for now — ESXi ties vmk0 to vmnic0. */
-    /* Get IP addresses from vmkernel interfaces */
-    fp = popen("/bin/esxcli network ip interface ipv4 get 2>/dev/null", "r");
-    if (fp) {
-        while (fgets(line, sizeof(line), fp)) {
-            char iface[16], ip[20], mask[20];
-            if (sscanf(line, "%15s %19s %19s", iface, ip, mask) >= 3) {
-                if (strncmp(iface, "vmk", 3) == 0) {
-                    int vmk_idx = atoi(iface + 3);
-                    if (vmk_idx >= 0 && vmk_idx < cache_nic_count) {
-                        strncpy(cache_net_dynamic[vmk_idx].ipv4, ip, 19);
-                        strncpy(cache_net_dynamic[vmk_idx].netmask, mask, 19);
-                    }
-                }
-            }
-        }
-        pclose(fp);
-    }
-}
 
 static void send_all_cached(uint32_t uptime_secs)
 {
@@ -708,42 +299,40 @@ static void send_all_cached(uint32_t uptime_secs)
      * 0x03 PrimaryOS: 3 strings [product, version, update]
      * 0x04 CurrentOS: 3 strings [product, version, build]
      * 0xCB ComputerName: 1 string */
-    if (cache_firmware[0]) {
-        const char *s[1] = { cache_firmware };
+    /* System info strings — all from cache_sysinfo (collect.h) */
+    if (cache_sysinfo.firmware[0]) {
+        const char *s[1] = { cache_sysinfo.firmware };
         apple_set_packed(0x01, 0x00, NULL, 0, s, 1);
     }
     {
-        const char *os3[3] = { cache_os_product, cache_os_version, cache_os_update };
+        const char *os3[3] = { cache_sysinfo.os_product, cache_sysinfo.os_version, cache_sysinfo.os_update };
         apple_set_packed(0x03, 0x00, NULL, 0, os3, 3);
     }
     {
-        const char *os4[3] = { cache_os_product, cache_os_version, cache_os_build };
+        const char *os4[3] = { cache_sysinfo.os_product, cache_sysinfo.os_version, cache_sysinfo.os_build };
         apple_set_packed(0x04, 0x00, NULL, 0, os4, 3);
     }
 
     /* 0xC0 ProcessorInfo: 12 binary + 1 packed string (CPU model) */
     {
-        const char *cpu_strs[1] = { cache_cpu_model };
+        const char *cpu_strs[1] = { cache_sysinfo.cpu_model };
         apple_set_packed(0xC0, 0x00, cache_cpu, 12, cpu_strs, 1);
     }
 
-    /* 0xC1 MiscellaneousInfo: 4 binary (total_ram_mb) + 2 packed strings (Model, Serial)
-     * The "RAM" key in Server Monitor reads the uint32 from the binary bytes.
-     * Previously we sent raw ASCII here which caused the 803 TB display. */
+    /* 0xC1 MiscellaneousInfo: 4 binary (total_ram_mb) + 2 packed strings */
     {
-        const char *misc_strs[2] = { cache_model, cache_serial };
+        const char *misc_strs[2] = { cache_sysinfo.model, cache_sysinfo.serial };
         apple_set_packed(0xC1, 0x00,
-                         (const uint8_t *)&cache_total_ram_mb, 4,
+                         (const uint8_t *)&cache_sysinfo.total_ram_mb, 4,
                          misc_strs, 2);
     }
 
-    /* Additional string params — also packed format */
-    if (cache_hostname[0]) {
-        const char *s[1] = { cache_hostname };
+    if (cache_sysinfo.hostname[0]) {
+        const char *s[1] = { cache_sysinfo.hostname };
         apple_set_packed(0x02, 0x00, NULL, 0, s, 1);
     }
-    if (cache_fqdn[0]) {
-        const char *s[1] = { cache_fqdn };
+    if (cache_sysinfo.fqdn[0]) {
+        const char *s[1] = { cache_sysinfo.fqdn };
         apple_set_packed(0xCB, 0x00, NULL, 0, s, 1);
     }
 
@@ -783,26 +372,19 @@ static void send_all_cached(uint32_t uptime_secs)
         apple_set_sel(0xC9, (uint8_t)i, dyn, 16);
     }
 
-    /* Per-drive: 0xC3 = 8 binary (Capacity uint64) + 5 strings
-     * Strings: [Kind, Manufacturer, Model, Interconnect, Location] */
+    /* Per-drive: 0xC3 + 0xC5 */
     for (int i = 0; i < cache_drive_count; i++) {
         const char *dstrs[5] = {
-            cache_drive_kind[i],      /* Kind: "SSD" or "HDD" */
-            cache_drive_vendor[i][0] ? cache_drive_vendor[i] : NULL,
-            cache_drive_model[i],     /* Model */
-            cache_drive_iface[i],     /* Interconnect: "SAS", "SATA" */
-            cache_drive_location[i]   /* Location: "Bay 1" */
+            cache_drives[i].kind,
+            cache_drives[i].vendor[0] ? cache_drives[i].vendor : NULL,
+            cache_drives[i].model,
+            cache_drives[i].iface,
+            cache_drives[i].location
         };
         apple_set_packed(0xC3, (uint8_t)i,
-                         (const uint8_t *)&cache_drive_binary[i],
+                         (const uint8_t *)&cache_drives[i].capacity_mb,
                          8, dstrs, 5);
     }
-
-    /* Per-drive: 0xC5 DriveDynamicInfo2 = 36 binary + 2 strings
-     * Binary (36 bytes): [BytesRead(8), BytesWritten(8), ... stats]
-     * Strings: [SMARTMessage, RaidLevel]
-     * Server Monitor needs both 0xC3 and 0xC5 to show drives.
-     * Send zeros for stats, empty strings for SMART/RAID. */
     for (int i = 0; i < cache_drive_count; i++) {
         uint8_t dyn[36];
         memset(dyn, 0, 36);
@@ -843,15 +425,15 @@ static void send_all_cached(uint32_t uptime_secs)
          * We can't reorder. Instead, make IP/mask empty when not
          * available so they take only 2 bytes each, leaving room
          * for Link/Speed/Duplex in block 0. */
-        const char *ip = cache_net_dynamic[i].ipv4;
-        const char *mask = cache_net_dynamic[i].netmask;
+        const char *ip = cache_nic_dynamic[i].ipv4;
+        const char *mask = cache_nic_dynamic[i].netmask;
         /* For NIC without IP, use empty so they take minimal space */
         const char *strs[5] = {
             (ip[0]) ? ip : NULL,
             (mask[0]) ? mask : NULL,
-            cache_net_dynamic[i].link,
-            cache_net_dynamic[i].mbps,
-            cache_net_dynamic[i].duplex
+            cache_nic_dynamic[i].link,
+            cache_nic_dynamic[i].mbps,
+            cache_nic_dynamic[i].duplex
         };
         int ret = apple_set_packed(0xC6, (uint8_t)i, bin, 20, strs, 5);
         if (ret < 0)
@@ -879,309 +461,65 @@ int bmc_init(void)
     bmc_available = 1;
 
     fprintf(stderr, "bmc: collecting system data...\n");
-    char buf[256];
 
-    /* Firmware */
-    if (popen_field("vsish -e get /hardware/bios/biosInfo",
-                    "BIOS Version", buf, sizeof(buf)) > 0) {
-        char *fw = buf; while (*fw == ' ') fw++;
-        strncpy(cache_firmware, fw, CACHE_SIZE - 1);
-    }
+    /* Collect system info via platform-specific implementation */
+    collect_system_info(&cache_sysinfo);
+    fprintf(stderr, "bmc: os: %s %s %s %s\n",
+            cache_sysinfo.os_product, cache_sysinfo.os_version,
+            cache_sysinfo.os_update, cache_sysinfo.os_build);
+    fprintf(stderr, "bmc: cpu: %s (%d sockets, %d cores, %d MHz)\n",
+            cache_sysinfo.cpu_model, cache_sysinfo.cpu_packages,
+            cache_sysinfo.cpu_cores, cache_sysinfo.cpu_speed_mhz);
+    fprintf(stderr, "bmc: misc: model=%s serial=%s ram=%u MB\n",
+            cache_sysinfo.model, cache_sysinfo.serial,
+            cache_sysinfo.total_ram_mb);
 
-    /* Hostname */
-    popen_field("/bin/esxcli system hostname get", "Host Name",
-                cache_hostname, CACHE_SIZE);
-
-    /* OS info — 0x03 and 0x04 each take 3 strings */
+    /* Build CPU binary: [packages, speed_mhz, cores_per_package] */
     {
-        popen_field("/bin/esxcli system version get", "Product",
-                    cache_os_product, CACHE_SIZE);
-        popen_field("/bin/esxcli system version get", "Version",
-                    cache_os_version, CACHE_SIZE);
-
-        char update[32] = "", patch[32] = "", build[64] = "";
-        popen_field("/bin/esxcli system version get", "Update",
-                    update, sizeof(update));
-        popen_field("/bin/esxcli system version get", "Patch",
-                    patch, sizeof(patch));
-        popen_field("/bin/esxcli system version get", "Build",
-                    build, sizeof(build));
-
-        snprintf(cache_os_update, CACHE_SIZE, "Update %s", update);
-        snprintf(cache_os_build, CACHE_SIZE, "Build %s", build);
-
-        fprintf(stderr, "bmc: os: %s %s %s %s\n",
-                cache_os_product, cache_os_version,
-                cache_os_update, cache_os_build);
-    }
-
-    /* FQDN */
-    popen_field("/bin/esxcli system hostname get",
-                "Fully Qualified Domain Name", cache_fqdn, CACHE_SIZE);
-
-    /* CPU */
-    {
-        int pkgs = 0, cores = 0, speed = 0;
-        popen_field("/bin/esxcli hardware cpu global get",
-                    "CPU Packages", buf, sizeof(buf));
-        pkgs = atoi(buf);
-        popen_field("/bin/esxcli hardware cpu global get",
-                    "CPU Cores", buf, sizeof(buf));
-        cores = atoi(buf);
-        popen_field("/bin/esxcli hardware cpu list",
-                    "Core Speed", buf, sizeof(buf));
-        /* Round to nearest 10 MHz for clean display (3324→3330) */
-        speed = (int)((atol(buf) + 5000000) / 10000000) * 10;
-        int cores_per_pkg = (pkgs > 0) ? (cores / pkgs) : cores;
-        /* Apple format: [packages, speed_mhz, cores_per_package]
-         * SM divides field2 by 1000 to get GHz.
-         * Must be MHz (not Hz) — Hz overflows signed int32 above 2.1 GHz */
-        uint32_t pdata[3] = { (uint32_t)pkgs, (uint32_t)speed, (uint32_t)cores_per_pkg };
+        int cores_per_pkg = (cache_sysinfo.cpu_packages > 0) ?
+            (cache_sysinfo.cpu_cores / cache_sysinfo.cpu_packages) :
+            cache_sysinfo.cpu_cores;
+        uint32_t pdata[3] = {
+            (uint32_t)cache_sysinfo.cpu_packages,
+            (uint32_t)cache_sysinfo.cpu_speed_mhz,
+            (uint32_t)cores_per_pkg
+        };
         memcpy(cache_cpu, pdata, 12);
-
-        char cpu_model[128];
-        popen_line("vsish -e get /hardware/cpu/cpuModelName",
-                   cpu_model, sizeof(cpu_model));
-        char *m = cpu_model; while (*m == ' ') m++;
-        collapse_spaces(m);
-        /* Strip "@ X.XXGHz" suffix — SM already shows speed from binary data */
-        char *at = strstr(m, " @");
-        if (!at) at = strstr(m, " @ ");
-        if (at) *at = '\0';
-        /* Also strip trailing spaces after truncation */
-        int ml = strlen(m);
-        while (ml > 0 && m[ml-1] == ' ') m[--ml] = '\0';
-        strncpy(cache_cpu_model, m, CACHE_SIZE - 1);
-        fprintf(stderr, "bmc: cpu: %s (%d sockets, %d cores, %d MHz)\n",
-                m, pkgs, cores, speed);
     }
 
-    /* 0xC1 MiscellaneousInfo:
-     * 4 binary bytes: uint32 total_ram_mb (the "RAM" key in Server Monitor)
-     * 2 packed strings: [Model, Serial]
-     * THIS IS WHERE SERVER MONITOR READS TOTAL MEMORY! */
+    /* Collect per-DIMM memory info via platform-specific implementation */
+    cache_dimm_count = collect_dimm_info(cache_dimms, MAX_DIMMS);
     {
-        popen_field("/bin/esxcli hardware platform get",
-                    "Serial Number", cache_serial, CACHE_SIZE);
-        popen_field("/bin/esxcli hardware platform get",
-                    "Product Name", cache_model, CACHE_SIZE);
-
-        /* Get total physical memory in MB */
-        popen_field("/bin/esxcli hardware memory get",
-                    "Physical Memory", buf, sizeof(buf));
-        long long total_bytes = atoll(buf);
-        /* Round to nearest GB boundary — ESXi reports slightly less
-         * than installed RAM due to kernel reservations */
-        cache_total_ram_mb = (uint32_t)(
-            ((total_bytes + (512LL * 1024 * 1024)) /
-             (1024LL * 1024 * 1024)) * 1024);
-
-        fprintf(stderr, "bmc: misc: model=%s serial=%s ram=%u MB\n",
-                cache_model, cache_serial, cache_total_ram_mb);
-    }
-
-    /* 0xC2 Memory: populate per-DIMM structs from SMBIOS Type 17.
-     *
-     * ESXi smbiosDump format for Type 17 (Memory Device):
-     *   Header:  "Type 17" in the section header line
-     *   Fields:  "   Device Locator: DIMM_A1"
-     *            "   Size: 16384 MB"
-     *            "   Memory Type: 0x18 (DDR3)"
-     *            "   Speed: 1066"
-     *
-     * We ONLY parse sections containing "Type 17" in the header.
-     * Fields use exact names to avoid matching other SMBIOS types.
-     * Hex prefixes like "0x18 (DDR3)" are cleaned to "DDR3".
-     */
-    {
-        cache_dimm_count = 0;
-
-        /*
-         * Parse smbiosDump output. Actual ESXi format:
-         *
-         *   Memory Device: #7            ← section header (2-space indent)
-         *     Location: "A1"             ← field (4-space indent)
-         *     Bank: "CPUA"
-         *     Type: 0x18 (DDR3)
-         *     Size: 16 GB
-         *     Speed: 1066 MHz
-         *   Type 130 Record: #8          ← next section (ends Memory Device)
-         *   64bit-Memory Error Info: #9  ← another section type
-         *
-         * Section headers: 2-space indent, name followed by ": #N"
-         * Fields: 4-space indent, "Key: Value"
-         * No blank lines between sections.
-         * Empty slots have "Size: No Memory Installed" and "Type: 0x02 (Unknown)"
-         */
-        FILE *fp = popen("smbiosDump 2>/dev/null", "r");
-        if (fp) {
-            char line[512];
-            int in_memdev = 0;
-            char loc[64] = "", spd[32] = "", typ[32] = "";
-            int size_mb_val = 0;
-
-            while (fgets(line, sizeof(line), fp)) {
-                /* Trim trailing whitespace/newlines */
-                int ll = strlen(line);
-                while (ll > 0 && (line[ll-1]=='\n'||line[ll-1]=='\r'
-                                  ||line[ll-1]==' '))
-                    line[--ll] = '\0';
-
-                /*
-                 * Section header detection:
-                 * Lines with exactly 2-space indent followed by a word
-                 * and ": #" are section headers.
-                 * e.g. "  Memory Device: #7"
-                 *      "  Type 130 Record: #8"
-                 *      "  64bit-Memory Error Info: #9"
-                 */
-                if (ll > 4 && line[0] == ' ' && line[1] == ' ' &&
-                    line[2] != ' ' && strstr(line, ": #")) {
-
-                    /* Save previous Memory Device entry if valid */
-                    if (in_memdev && size_mb_val > 0 &&
-                        cache_dimm_count < MAX_DIMMS) {
-                        struct dimm_info *d = &cache_dimms[cache_dimm_count];
-                        d->config_type = 0x00;
-                        d->ecc_type = 0x00;
-                        d->size_mb = (uint32_t)size_mb_val;
-                        strncpy(d->slot_name, loc[0] ? loc : "DIMM",
-                                sizeof(d->slot_name) - 1);
-                        strncpy(d->speed, spd[0] ? spd : "Unknown",
-                                sizeof(d->speed) - 1);
-                        strncpy(d->type, typ[0] ? typ : "DDR3 ECC",
-                                sizeof(d->type) - 1);
-                        cache_dimm_count++;
-                    }
-
-                    /* Check if this new section is a Memory Device */
-                    in_memdev = (strstr(line, "Memory Device") != NULL &&
-                                 strstr(line, "Mapped") == NULL) ? 1 : 0;
-                    loc[0] = spd[0] = typ[0] = '\0';
-                    size_mb_val = 0;
-                    continue;
-                }
-
-                if (!in_memdev) continue;
-
-                /* Field lines: 4-space indent, "Key: Value" */
-                if (line[0] != ' ' || line[1] != ' ' ||
-                    line[2] != ' ' || line[3] != ' ')
-                    continue;
-
-                char *field = line + 4;  /* skip 4-space indent */
-                char *p;
-
-                /* Location: "A1" — strip quotes */
-                if (strncmp(field, "Location:", 9) == 0) {
-                    p = field + 9;
-                    while (*p == ' ') p++;
-                    /* Strip surrounding quotes */
-                    if (*p == '"') p++;
-                    int sl = strlen(p);
-                    if (sl > 0 && p[sl-1] == '"') p[--sl] = '\0';
-                    strncpy(loc, p, sizeof(loc) - 1);
-                }
-                /* Size: 16 GB  or  Size: 2 GB  or  Size: No Memory Installed */
-                else if (strncmp(field, "Size:", 5) == 0 &&
-                         !strstr(field, "Max")) {
-                    p = field + 5;
-                    while (*p == ' ') p++;
-                    if (strstr(p, "No Memory") || strstr(p, "Not")) {
-                        size_mb_val = 0;
-                    } else {
-                        size_mb_val = atoi(p);
-                        if (strstr(p, "GB"))
-                            size_mb_val *= 1024;
-                        else if (strstr(p, "KB"))
-                            size_mb_val /= 1024;
-                        /* "MB" = already in MB, no conversion */
-                    }
-                }
-                /* Type: 0x18 (DDR3) — extract description from parens */
-                else if (strncmp(field, "Type:", 5) == 0 &&
-                         !strstr(field, "Detail")) {
-                    p = field + 5;
-                    while (*p == ' ') p++;
-                    char *paren = strchr(p, '(');
-                    if (paren) {
-                        paren++;
-                        char *end = strchr(paren, ')');
-                        if (end) {
-                            int tl = end - paren;
-                            if (tl > (int)sizeof(typ) - 1)
-                                tl = sizeof(typ) - 1;
-                            strncpy(typ, paren, tl);
-                            typ[tl] = '\0';
-                            /* Skip "Unknown" — empty slots have this */
-                            if (strcmp(typ, "Unknown") == 0)
-                                typ[0] = '\0';
-                        }
-                    }
-                }
-                /* Speed: 1066 MHz */
-                else if (strncmp(field, "Speed:", 6) == 0) {
-                    p = field + 6;
-                    while (*p == ' ') p++;
-                    int mhz = atoi(p);
-                    if (mhz > 0)
-                        snprintf(spd, sizeof(spd), "%d MHz", mhz);
-                }
-            }
-
-            /* Save last entry */
-            if (in_memdev && size_mb_val > 0 &&
-                cache_dimm_count < MAX_DIMMS) {
-                struct dimm_info *d = &cache_dimms[cache_dimm_count];
-                d->config_type = 0x00;
-                d->ecc_type = 0x00;
-                d->size_mb = (uint32_t)size_mb_val;
-                strncpy(d->slot_name, loc[0] ? loc : "DIMM",
-                        sizeof(d->slot_name) - 1);
-                strncpy(d->speed, spd[0] ? spd : "Unknown",
-                        sizeof(d->speed) - 1);
-                strncpy(d->type, typ[0] ? typ : "DDR3",
-                        sizeof(d->type) - 1);
-                cache_dimm_count++;
-            }
-            pclose(fp);
-        }
-
-        /* Log what we found */
         uint64_t total_mb = 0;
         for (int i = 0; i < cache_dimm_count; i++)
             total_mb += cache_dimms[i].size_mb;
         fprintf(stderr, "bmc: memory: %llu MB total, %d DIMMs\n",
                 (unsigned long long)total_mb, cache_dimm_count);
-        for (int i = 0; i < cache_dimm_count; i++) {
+        for (int i = 0; i < cache_dimm_count; i++)
             fprintf(stderr, "bmc:   [%d] %s: %u MB, %s, %s\n",
                     i, cache_dimms[i].slot_name,
                     cache_dimms[i].size_mb,
                     cache_dimms[i].speed, cache_dimms[i].type);
-        }
     }
 
-    /* Drives (per-device, cached at startup only) */
-    collect_drives();
+    /* Collect drives */
+    cache_drive_count = collect_drive_info(cache_drives, MAX_DRIVES);
     fprintf(stderr, "bmc: drives: %d devices\n", cache_drive_count);
     for (int i = 0; i < cache_drive_count; i++)
-        fprintf(stderr, "bmc:   [%d] %s\n", i, cache_drive_entries[i]);
+        fprintf(stderr, "bmc:   [%d] %s\n", i, cache_drives[i].display);
 
-    /* NICs */
-    collect_nics();
-    collect_net_dynamic();
+    /* Collect NICs */
+    cache_nic_count = collect_nic_static(cache_nic_static, MAX_NICS);
+    collect_nic_dynamic(cache_nic_dynamic, cache_nic_count);
     fprintf(stderr, "bmc: nics: %d devices\n", cache_nic_count);
     for (int i = 0; i < cache_nic_count; i++)
         fprintf(stderr, "bmc:   [%d] %s %s %s\n", i,
-                cache_nic_static[i].name,
-                cache_nic_static[i].mac,
-                cache_net_dynamic[i].ipv4);
+                cache_nic_static[i].name, cache_nic_static[i].mac,
+                cache_nic_dynamic[i].ipv4);
 
-    /* Record initial state for change detection */
-    drive_count = count_disk_devices();
-    struct stat st;
-    if (stat("/etc/vmware/esx.conf", &st) == 0)
-        network_mtime = st.st_mtime;
+    /* Initialize change detection */
+    detect_drive_changes();
+    detect_network_changes();
 
     /* Get system uptime for initial send.
      * Try multiple sources — /proc/uptime may not exist on ESXi. */
@@ -1248,21 +586,16 @@ int bmc_update(uint64_t uptime_usec)
 {
     if (!bmc_available) return -1;
 
-    /* Check for drive changes (count devices — immune to I/O noise) */
-    int cur_count = count_disk_devices();
-    if (cur_count >= 0 && cur_count != drive_count) {
-        fprintf(stderr, "bmc: drive change detected (%d -> %d)\n",
-                drive_count, cur_count);
-        collect_drives();
-        drive_count = cur_count;
+    /* Check for drive changes via platform-specific detection */
+    if (detect_drive_changes() > 0) {
+        fprintf(stderr, "bmc: drive change detected\n");
+        cache_drive_count = collect_drive_info(cache_drives, MAX_DRIVES);
     }
 
-    /* Check for network config changes (stat mtime) */
-    struct stat st;
-    if (stat("/etc/vmware/esx.conf", &st) == 0 && st.st_mtime != network_mtime) {
+    /* Check for network changes via platform-specific detection */
+    if (detect_network_changes() > 0) {
         fprintf(stderr, "bmc: network change detected\n");
-        collect_net_dynamic();
-        network_mtime = st.st_mtime;
+        collect_nic_dynamic(cache_nic_dynamic, cache_nic_count);
     }
 
     /* Resend everything with fresh uptime */

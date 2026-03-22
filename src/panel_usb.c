@@ -406,23 +406,24 @@ static int submit_poll_reap_safe(int fd, uint8_t endpoint, void *buf, int len)
     }
 
     /*
-     * Reap using ESXi's NATIVE ioctl number (0xC0105512), NOT the
-     * Linux ioctl number (0x4008550D).
+     * Reap the completed URB.
      *
-     * vmkusb's ioctl dispatch has TWO reap code paths:
-     *   - Linux REAPURBNDELAY (0x4008550D): falls through to default
-     *     handler → udev_reapurb_sub → BUGGY (releases spinlock at
-     *     device+0x168 before accessing URB = race condition = PSOD)
-     *   - ESXi native REAPURB (0xC0105512): dispatches directly to
-     *     udev_handle_ioctl → SAFE (properly locked, no race)
+     * On ESXi: use native ioctl 0xC0105512 which dispatches to
+     * udev_handle_ioctl (properly locked). The standard Linux
+     * REAPURBNDELAY ioctl falls through to udev_reapurb_sub which
+     * has a race condition causing PSOD.
      *
-     * This is the same ioctl libusb on ESXi uses (32-bit: 0xC00C5512,
-     * 64-bit: 0xC0105512). Confirmed by disassembling both vmkusb
-     * and /lib/libusb-1.0.so on ESXi 6.5.
+     * On Linux: standard REAPURBNDELAY works fine — the Linux kernel
+     * USB driver doesn't have the vmkusb bug.
      */
+#ifdef __ESXI__
     struct { void *urb_ptr; uint64_t pad; } reap_buf;
     memset(&reap_buf, 0, sizeof(reap_buf));
     ret = ioctl(fd, (int)0xC0105512u, &reap_buf);
+#else
+    void *reap_ptr = NULL;
+    ret = ioctl(fd, USBDEVFS_REAPURBNDELAY, &reap_ptr);
+#endif
     if (ret < 0) return -2;
 
     return 0;

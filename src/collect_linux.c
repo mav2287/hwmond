@@ -55,7 +55,6 @@ static int popen_line(const char *cmd, char *buf, int bufsz)
 
 int collect_system_info(system_info_t *info)
 {
-    char buf[256];
     memset(info, 0, sizeof(*info));
 
     /* Firmware / BIOS version */
@@ -320,7 +319,7 @@ int collect_drive_info(drive_info_t *drives, int max_drives)
 
     char line[512];
     while (fgets(line, sizeof(line), fp) && count < max_drives) {
-        char name[32] = "", model[64] = "", vendor[32] = "", tran[16] = "";
+        char name[32] = "";
         long long size_bytes = 0;
         int rota = 1;
 
@@ -486,8 +485,6 @@ int collect_nic_static(nic_static_t *nics, int max_nics)
 int collect_nic_dynamic(nic_dynamic_t *nics, int nic_count)
 {
     for (int i = 0; i < nic_count; i++) {
-        char path[128], buf[32];
-        char *name = nics[i].link;  /* Temporarily reuse — we need the NIC name */
         /* Actually we need the name from nic_static. The caller must match indices. */
         /* For now, we'll read from /sys using the index order */
 
