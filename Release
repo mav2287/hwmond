@@ -5,10 +5,10 @@ Codename: stable
 Architectures: amd64
 Components: .
 Description: Apple Xserve hardware monitor for Linux
-Date: Sun, 22 Mar 2026 04:14:04 UTC
+Date: Sun, 22 Mar 2026 04:37:57 UTC
 MD5Sum:
- 1a58ba6a2f89547a9d842d41d9148543 754 Packages
- fa2f24b4c2c9e18cdfedfa1b2d6593b6 523 Packages.gz
+ b5030869a9c10a23b403c5005363a970 566 Packages
+ 747d2ff72991edc2314c2a4d2536ab00 415 Packages.gz
 SHA256:
- bf37e8d7788419748a2fc04f534acd63be612a62970a117ebf7c0cee665caa64 754 Packages
- 9b5424ad10c65bd4d1d4080341b89521a17068b5f166042022a5ed5f8fc6e16a 523 Packages.gz
+ d0b2f66356a0903657c6de1c03876f1ebbf635ac0339552440d896a9ef6d58e4 566 Packages
+ bab23928b69c9f101fcaa1e5607a95ee94e984648b2aa0a6b4ecae62e1a895dc 415 Packages.gz

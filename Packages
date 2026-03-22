@@ -1,20 +1,17 @@
 Package: hwmond-xserve
-Version: 3.1.4
+Version: 3.1.5
 Architecture: amd64
 Maintainer: hwmond <hwmond@github.com>
 Depends: dmidecode, openipmi
 Recommends: ipmitool, smartmontools, ethtool
-Filename: ./hwmond-xserve-3.1.4-linux-amd64.deb
-Size: 52480
-MD5sum: 884a2aac20801885b24aab2789423469
-SHA1: 75c763c5594a43073fdb65177d2477739477e4f8
-SHA256: 4f938a0e3c60648c95bfd2a5a90d3a92c9a26d8ba3a6d182b09e156eabb30d34
+Filename: ./hwmond-xserve-3.1.5-linux-amd64.deb
+Size: 52904
+MD5sum: 797fe3a4c1eb15fff1d33cbd5eda1906
+SHA1: 64adf482b98fe70306c4b3fa9b5c3c4641ccabac
+SHA256: c2e7b37b6b2916b441e6fbcceb5f9c0010fa59b3b5b0fdc6df8b16deb1ae7e28
 Section: admin
 Priority: optional
 Homepage: https://github.com/mav2287/hwmond
 Description: Apple Xserve hardware monitor for Linux
- Drives the front panel CPU activity LED bar graph and populates
- the BMC with system data for Apple Server Monitor compatibility
- on Apple Xserve (1,1 / 2,1 / 3,1) servers running Linux.
- WARNING: ONLY for Apple Xserve hardware.
+ ONLY for Apple Xserve (1,1 / 2,1 / 3,1).
 
