@@ -1,0 +1,7 @@
+Origin: hwmond
+Label: hwmond
+Suite: stable
+Codename: stable
+Architectures: amd64
+Components: .
+Description: Apple Xserve hardware monitor for Linux

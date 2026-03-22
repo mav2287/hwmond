@@ -1,0 +1,39 @@
+<vib version="5.0">
+  <type>bootbank</type>
+  <name>hwmond-xserve</name>
+  <version>3.0.0-1</version>
+  <vendor>hwmond</vendor>
+  <summary>Xserve front panel CPU LED daemon and BMC for ESXi</summary>
+  <description>Drives the CPU activity LED bar graph and populates BMC with system data for Apple Server Monitor.</description>
+  <release-date>2026-03-17T08:12:29</release-date>
+  <urls>
+    <url key="website">https://github.com/mav2287/hwmond</url>
+  </urls>
+  <relationships>
+    <depends></depends>
+    <conflicts/>
+    <replaces/>
+    <provides/>
+    <compatibleWith/>
+  </relationships>
+  <software-tags></software-tags>
+  <system-requires>
+    <maintenance-mode>false</maintenance-mode>
+  </system-requires>
+  <file-list>
+    <file>opt/hwmond/hwmond</file>
+    <file>etc/rc.local.d/hwmond-startup.sh</file>
+    <file>etc/init.d/hwmond</file>
+  </file-list>
+  <acceptance-level>community</acceptance-level>
+  <live-install-allowed>false</live-install-allowed>
+  <live-remove-allowed>true</live-remove-allowed>
+  <cimom-restart>false</cimom-restart>
+  <stateless-ready>true</stateless-ready>
+  <overlay>false</overlay>
+  <payloads>
+    <payload name="payload1" type="tgz" size="64352">
+        <checksum checksum-type="sha-256">ad8a14bb3169793b1f3bdddb766186ed66db2c3155146d1a133d16c78b2753bf</checksum>
+    </payload>
+  </payloads>
+</vib>
