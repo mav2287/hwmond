@@ -235,7 +235,7 @@ int collect_system_info(system_info_t *info)
      * dmidecode -t 17 gives per-DIMM sizes; sum them for true total.
      * Falls back to /proc/meminfo if dmidecode fails. */
     {
-        FILE *fp = popen("dmidecode -t 17 2>/dev/null | awk '/^\\tSize:.*[0-9]/ && !/No Module/{s+=$2} END{print s}'", "r");
+        FILE *fp = popen("dmidecode -t 17 2>/dev/null | awk '/^\\tSize:.*[0-9]/ && !/No Module/{v=$2; u=$3; if(u==\"GB\")v*=1024; s+=v} END{print s}'", "r");
         if (fp) {
             char buf[32] = {0};
             if (fgets(buf, sizeof(buf), fp)) {
