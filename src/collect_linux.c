@@ -230,20 +230,36 @@ int collect_system_info(system_info_t *info)
         popen_line("dmidecode -s system-product-name 2>/dev/null", info->model, CACHE_SIZE);
 
     /* Total RAM from /proc/meminfo */
+    /* Total RAM from SMBIOS (physical installed), not /proc/meminfo
+     * (which reports kernel-available, ~3 GB less on a 192 GB machine).
+     * dmidecode -t 17 gives per-DIMM sizes; sum them for true total.
+     * Falls back to /proc/meminfo if dmidecode fails. */
     {
-        FILE *fp = fopen("/proc/meminfo", "r");
+        FILE *fp = popen("dmidecode -t 17 2>/dev/null | awk '/^\\tSize:.*[0-9]/ && !/No Module/{s+=$2} END{print s}'", "r");
         if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "MemTotal:", 9) == 0) {
-                    long long kb = atoll(line + 9);
-                    /* Round to nearest GB */
-                    info->total_ram_mb = (uint32_t)(
-                        ((kb + 512*1024) / (1024*1024)) * 1024);
-                    break;
-                }
+            char buf[32] = {0};
+            if (fgets(buf, sizeof(buf), fp)) {
+                long long mb = atoll(buf);
+                if (mb > 0)
+                    info->total_ram_mb = (uint32_t)mb;
             }
-            fclose(fp);
+            pclose(fp);
+        }
+        /* Fallback to /proc/meminfo if dmidecode gave nothing */
+        if (info->total_ram_mb == 0) {
+            fp = fopen("/proc/meminfo", "r");
+            if (fp) {
+                char line[256];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strncmp(line, "MemTotal:", 9) == 0) {
+                        long long kb = atoll(line + 9);
+                        info->total_ram_mb = (uint32_t)(
+                            ((kb + 512*1024) / (1024*1024)) * 1024);
+                        break;
+                    }
+                }
+                fclose(fp);
+            }
         }
     }
 
