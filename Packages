@@ -1,14 +1,14 @@
 Package: hwmond-xserve
-Version: 3.2.4
+Version: 3.2.5
 Architecture: amd64
 Maintainer: hwmond <hwmond@github.com>
 Depends: dmidecode, openipmi
 Recommends: ipmitool, smartmontools, ethtool
-Filename: ./hwmond-xserve-3.2.4-linux-amd64.deb
-Size: 63812
-MD5sum: 36e3e6ac63a2c3c3c158445454ec004b
-SHA1: 1ca44e5c9788af7b1a4ee2fba44432d199407b03
-SHA256: 62a7319c92fcc42b61e45ed88dd642f2d4b0dacdc14c518066180421abc6a4e8
+Filename: ./hwmond-xserve-3.2.5-linux-amd64.deb
+Size: 64172
+MD5sum: 4f2349a8f11288459afe5abc29996768
+SHA1: 6f679b9037d11fb66729ef13e5fa4a3ae4f67ca0
+SHA256: b592093408b6f5496e3adec0d0a50d15f1a0ae3c67748c96fbe97aeb048cfa03
 Section: admin
 Priority: optional
 Homepage: https://github.com/mav2287/hwmond
