@@ -555,6 +555,19 @@ int collect_nic_static(nic_static_t *nics, int max_nics)
     return count;
 }
 
+/* Validate interface name contains only safe characters (a-z, 0-9, -, ., _)
+ * before passing to shell commands. Returns 1 if safe, 0 if suspect. */
+static int is_safe_ifname(const char *name)
+{
+    if (!name || !name[0]) return 0;
+    for (const char *p = name; *p; p++) {
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+              (*p >= '0' && *p <= '9') || *p == '-' || *p == '.' || *p == '_'))
+            return 0;
+    }
+    return 1;
+}
+
 int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
                         int nic_count)
 {
@@ -617,6 +630,7 @@ int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
 
             /* Try each interface for an IP (most specific first, then up) */
             for (int t = try_count - 1; t >= 0 && !dynamic[i].ipv4[0]; t--) {
+                if (!is_safe_ifname(try_ifaces[t])) continue;
                 char cmd[128];
                 snprintf(cmd, sizeof(cmd),
                          "ip -4 addr show %s 2>/dev/null | grep inet",
@@ -634,6 +648,7 @@ int collect_nic_dynamic(nic_dynamic_t *dynamic, const nic_static_t *nics_static,
                                 if (iplen < (int)sizeof(dynamic[i].ipv4))
                                     strncpy(dynamic[i].ipv4, p, iplen);
                                 int prefix = atoi(slash + 1);
+                                if (prefix < 0 || prefix > 32) prefix = 0;
                                 uint32_t mask = prefix ? (~0U << (32 - prefix)) : 0;
                                 snprintf(dynamic[i].netmask,
                                          sizeof(dynamic[i].netmask),

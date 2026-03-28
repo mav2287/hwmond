@@ -231,7 +231,7 @@ static int apple_set_packed(uint8_t param, uint8_t set_sel,
      * which returns usedBufLen + 2 as the length field.
      * For null/empty strings: [0x01, 0x00] (length=1, null byte) */
     for (int i = 0; i < str_count; i++) {
-        if (pos + 2 > MAX_PACKED_BUF) break;
+        if (pos + 4 > MAX_PACKED_BUF) break;  /* need room for len + null + pad + margin */
         if (strings[i] && strings[i][0]) {
             int slen = strlen(strings[i]);
             int wire_len = slen + 2;  /* Apple's format: strlen + 2 */

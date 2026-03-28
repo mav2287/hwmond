@@ -14,8 +14,18 @@ StandardError=journal
 SyslogIdentifier=hwmond
 
 # Security hardening
+NoNewPrivileges=true
 ProtectHome=true
 PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/dev /var/run
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
